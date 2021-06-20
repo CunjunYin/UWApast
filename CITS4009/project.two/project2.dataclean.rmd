@@ -1,0 +1,266 @@
+---
+title: "CITS4009 project2 data clean"
+author: "Cunjun Yin : 22249435"
+output:
+  html_document:
+    fig_width: 10
+    fig_height: 10
+---
+
+# Init
+```{R message=FALSE, warning=FALSE}
+library(vtreat)
+library(dplyr)
+library(scales)
+library(lubridate)
+library(psych)
+library(plyr)
+library(parallel)
+```
+
+#### Load data
+```{R message=FALSE, warning=FALSE}
+accidents <- read.csv("DATA/us_data.csv")
+
+names <- c('MINE_ID', 'NARRATIVE', 'CONTROLLER_ID', 'OPERATOR_ID', 'SUBUNIT_CD', 'DEGREE_INJURY_CD', 'UG_LOCATION_CD', 
+           'UG_MINING_METHOD_CD', 'MINING_EQUIP_CD', 'EQUIP_MFR_CD', 'CLASSIFICATION_CD', 'ACCIDENT_TYPE_CD', 'IMMED_NOTIFY_CD',
+           'OCCUPATION_CD', 'ACTIVITY_CD', 'INJURY_SOURCE_CD', 'NATURE_INJURY_CD', 'INJ_BODY_PART_CD', 'EQUIP_MODEL_NO', 'CONTROLLER_NAME',
+           'CLOSED_DOC_NO', 'DOCUMENT_NO', 'OPERATOR_NAME', 'OPERATOR_NAME', 'FISCAL_YR', 'FISCAL_QTR', 'CAL_QTR', 'FIPS_STATE_CD',
+           'EQUIP_MFR_NAME', 'MINING_EQUIP', "TRANS_TERM")
+
+accidents          <- accidents[-which(colnames(accidents) %in% names)]
+```
+
+```{R}
+chackNA <- function(){
+    NAs <- apply(is.na(accidents), 2, sum)
+    print(NAs[NAs>0])
+    cat("NO VALUE FOUND\n")
+    NVF <- apply(accidents=="NO VALUE FOUND", 2, sum)
+    print(NVF[NVF>0 & !is.na(NVF)])
+}
+chackNA()
+```
+
+# Get hours worked when involved in accident
+1 accident time is NA, so safe to remove
+
+```{R}
+accidents          <- accidents[-which(is.na(accidents$ACCIDENT_TIME)),]
+```
+
+Remove shift begin time columns what contain 
+
+```{R}
+accidents          <- accidents[-which(is.na(accidents$SHIFT_BEGIN_TIME)),]
+```
+
+Check both accident time and shift begin time is NA after data correction, if true then remove it
+
+```{R}
+accidents <- within(accidents, {
+    ACCIDENT_TIME[which(ACCIDENT_DT=="2010-04-05" & NO_INJURIES == 36)]          <- 1502
+    ACCIDENT_TIME[which(ACCIDENT_TIME > 2400)]    <- NA
+    SHIFT_BEGIN_TIME[which(SHIFT_BEGIN_TIME > 2400)] <- NA
+})
+accidents <- accidents[-which(is.na(accidents$ACCIDENT_TIME) & is.na(accidents$SHIFT_BEGIN_TIME)),]
+chackNA()
+```
+
+An estimate of SHIFT_BEGIN_TIME and ACCIDENT_TIME by mean subset of that time
+```{R}
+meanAtime <- round(mean(accidents$ACCIDENT_TIME, na.rm = TRUE),0)
+meanStime <- round(mean(accidents$SHIFT_BEGIN_TIME, na.rm = TRUE),0)
+for(i in 1:length(accidents$ACCIDENT_TIME)) {
+    if (is.na(accidents$ACCIDENT_TIME[i])) {
+        tmp <- accidents[which(accidents$SHIFT_BEGIN_TIME==accidents$SHIFT_BEGIN_TIME[i]), 'ACCIDENT_TIME']
+        if(length(tmp) >0 ){
+            tmp <- mean(tmp, na.rm=TRUE)
+            accidents$ACCIDENT_TIME[i] <- round(tmp,0)
+        }else{
+            accidents$ACCIDENT_TIME[i] <- meanAtime
+        }
+    }else if(is.na(accidents$SHIFT_BEGIN_TIME[i])) {
+        tmp <- accidents[which(accidents$ACCIDENT_TIME==accidents$ACCIDENT_TIME[i]), 'SHIFT_BEGIN_TIME']
+        if(length(tmp) > 0 ){
+            tmp <- mean(tmp, na.rm=TRUE)
+            accidents$SHIFT_BEGIN_TIME[i] <- round(tmp,0)
+        }else{
+            accidents$SHIFT_BEGIN_TIME[i] <- meanStime
+        }
+    }
+}
+accidents<-accidents[-which(is.nan(accidents$ACCIDENT_TIME) | is.nan(accidents$SHIFT_BEGIN_TIME)),]
+```
+
+Function to calculate hours worked
+```{R}
+hoursWork <- function(begin, end) {
+    dst <- c()
+    for(i in 1:length(begin)) {
+        if(is.na(begin[i]) | is.na(end[i])){
+            dst <- c(dst, NA)
+        }else if(begin[i] < end[i]) {
+            tmp <- end[i] - begin[i]
+            if(tmp > 1300){ # makes above no sense 13 hours of work
+                tmp <- NA
+            }
+            dst <- c(dst, tmp)
+        }else {
+            tmp <- (end[i] + 2400) - begin[i]
+            
+            if(tmp > 1300){ # makes above no sense 13 hours of work
+                tmp <- NA
+            }
+            dst <- c(dst, tmp)
+        }
+    }
+    m <- mean(dst, na.rm = TRUE)
+    s <- sd(dst, na.rm = TRUE)
+    for(i in 1:length(dst)){
+        if (is.na(dst[i])){
+            tmp<-round(rnorm(1, m, s),0)
+            while (tmp <= 0) {tmp<-round(rnorm(1, m, s),0)}
+            dst[i] <- tmp
+        }
+    }
+    dst
+}
+accidents$hours <- hoursWork(accidents$SHIFT_BEGIN_TIME, accidents$ACCIDENT_TIME)
+
+chackNA()
+```
+
+# Data filling based on information provided by data
+```{R}
+accidents <- within(accidents, {
+    CONTRACTOR_ID     <- ifelse(CONTRACTOR_ID        == "", 0, 1)
+    COAL_METAL_IND    <- ifelse(COAL_METAL_IND       == "C", "Coal", "Metal")
+
+    # lots of outcome dosent relate to what was described 
+    SCHEDULE_CHARGE[which(IMMED_NOTIFY   == 'DEATH')]                                  <- 6000
+    DAYS_RESTRICT[which(SCHEDULE_CHARGE  == 6000)]                                     <- 0
+    DAYS_LOST[which(SCHEDULE_CHARGE      == 6000)]                                     <- 0
+    SCHEDULE_CHARGE[which(DEGREE_INJURY  == 'FATALITY')]                               <- 6000
+    DEGREE_INJURY[which(SCHEDULE_CHARGE  == 6000)]                                     <- 'FATALITY'
+
+    DAYS_RESTRICT[which(DEGREE_INJURY    == "NO DYS AWY FRM WRK,NO RSTR ACT")]         <- 0
+    DAYS_LOST[which(DEGREE_INJURY        == "NO DYS AWY FRM WRK,NO RSTR ACT")]         <- 0
+    SCHEDULE_CHARGE[which(DEGREE_INJURY  == "NO DYS AWY FRM WRK,NO RSTR ACT")]         <- 0
+
+    DAYS_LOST[which(DEGREE_INJURY        == 'DAYS RESTRICTED ACTIVITY ONLY' )]         <- 0
+    SCHEDULE_CHARGE[which(DEGREE_INJURY  == 'DAYS RESTRICTED ACTIVITY ONLY' )]         <- 0
+
+    DAYS_RESTRICT[which(DEGREE_INJURY    == 'DAYS AWAY FROM WORK ONLY')]                <- 0
+    SCHEDULE_CHARGE[which(DEGREE_INJURY  == 'DAYS AWAY FROM WORK ONLY')]                <- 0
+
+    SCHEDULE_CHARGE[which(DEGREE_INJURY  == 'DYS AWY FRM WRK & RESTRCTD ACT' & is.na(SCHEDULE_CHARGE))] <- 0
+
+    DAYS_RESTRICT[which(ACCIDENT_TYPE    == 'ACC TYPE, WITHOUT INJURIES' | NO_INJURIES==0 )]  <- 0
+    DAYS_LOST[which(ACCIDENT_TYPE        == 'ACC TYPE, WITHOUT INJURIES' | NO_INJURIES==0)]   <- 0
+    SCHEDULE_CHARGE[which(ACCIDENT_TYPE  == 'ACC TYPE, WITHOUT INJURIES' | NO_INJURIES==0)]   <- 0
+    NO_INJURIES[which(ACCIDENT_TYPE  == 'ACC TYPE, WITHOUT INJURIES')]                        <- 0
+    ACCIDENT_TYPE[which(NO_INJURIES  == 0)]                                                   <- 'ACC TYPE, WITHOUT INJURIES'
+
+    UG_LOCATION[which(UG_LOCATION == "NO VALUE FOUND" & SUBUNIT!= 'UNDERGROUND')]           <- "Not underground"
+    UG_MINING_METHOD[which(UG_MINING_METHOD == "NO VALUE FOUND" & SUBUNIT!= 'UNDERGROUND')] <- "Not underground"
+
+    ACCIDENT_DT      <- as.character(as.POSIXct(ACCIDENT_DT, format="%d/%m/%Y"))
+
+    TOT_EXPER  <- ifelse(is.na(TOT_EXPER) & !is.na(MINE_EXPER) & !is.na(JOB_EXPER), ifelse(MINE_EXPER>=JOB_EXPER, MINE_EXPER, JOB_EXPER), TOT_EXPER)
+    TOT_EXPER  <- ifelse(is.na(TOT_EXPER) & is.na(MINE_EXPER) & !is.na(JOB_EXPER), JOB_EXPER, TOT_EXPER)
+    TOT_EXPER  <- ifelse(is.na(TOT_EXPER) & !is.na(MINE_EXPER) & is.na(JOB_EXPER), MINE_EXPER, TOT_EXPER)
+    MINE_EXPER <- ifelse(is.na(MINE_EXPER)& TOT_EXPER == JOB_EXPER, TOT_EXPER, MINE_EXPER)
+    JOB_EXPER  <- ifelse(is.na(JOB_EXPER) & TOT_EXPER == MINE_EXPER, TOT_EXPER, JOB_EXPER)
+})
+```
+
+# Remove rows
+Information given and outcome not same
+```{R}
+accidents <- accidents[-which(accidents$DEGREE_INJURY=='DAYS RESTRICTED ACTIVITY ONLY' & accidents$DAYS_RESTRICT==0 ),] 
+accidents <- accidents[-which(accidents$DEGREE_INJURY=='DAYS AWAY FROM WORK ONLY' & accidents$DAYS_LOST==0 ),]
+accidents <- accidents[-which(accidents$DEGREE_INJURY=='DYS AWY FRM WRK & RESTRCTD ACT' & accidents$DAYS_LOST==0 & accidents$DAYS_RESTRICT==0),] 
+```
+
+```{R}
+accidents <- accidents[-which(colnames(accidents) %in% c('IMMED_NOTIFY', 'SHIFT_BEGIN_TIME'))]
+accidents <- accidents[-which(accidents$UG_LOCATION =="NO VALUE FOUND"),] %>%
+             rename(replace=c('CONTRACTOR_ID'='IsContract', 'COAL_METAL_IND'='Minerals'))
+accidents <- accidents[-which(accidents$DEGREE_INJURY=="NO VALUE FOUND"),]
+```
+
+# experence random Normal  distribution filling, based on mean and sd
+```{R}
+randnorm <- function(mean, sd, value, i){
+    dst <- round(rnorm(1, mean, sd),2)
+    if(dst > 0 & dst <= value) {
+        return(dst)
+    }else if(value < 1){
+        return(value)
+    }else {
+        return(randnorm(mean, sd, value, i+1))
+    }
+}
+norm <- c(c(mean(accidents$TOT_EXPER, na.rm=T), sd(accidents$TOT_EXPER, na.rm=T)), c(mean(accidents$MINE_EXPER, na.rm=T), sd(accidents$MINE_EXPER, na.rm=T)), c(mean(accidents$JOB_EXPER, na.rm=T), sd(accidents$JOB_EXPER, na.rm=T)))
+tmp <- 0
+accidents$TOT_EXPER.isbad <- 0
+accidents$MINE_EXPER.isbad <- 0
+accidents$JOB_EXPER.isbad <- 0
+for(i in 1:nrow(accidents)) {
+    if(is.na(accidents[i, 'TOT_EXPER']) & is.na(accidents[i, 'MINE_EXPER']) & is.na(accidents[i, 'JOB_EXPER'])) {
+        accidents$TOT_EXPER[i]  <- randnorm(norm[1], norm[2], 99, i)
+        accidents$MINE_EXPER[i] <- randnorm(norm[3], norm[4], accidents$TOT_EXPER[i], i)
+        accidents$JOB_EXPER[i]  <- randnorm(norm[5], norm[6], accidents$TOT_EXPER[i], i)
+
+        accidents$TOT_EXPER.isbad[i]  <- 1
+        accidents$MINE_EXPER.isbad[i] <- 1
+        accidents$JOB_EXPER.isbad[i]  <- 1
+    }
+}
+
+for (i in 1:nrow(accidents)) {
+    if(is.na(accidents[i, 'MINE_EXPER']) | is.na(accidents[i, 'JOB_EXPER'])) {
+        partial <- subset(accidents, TOT_EXPER == accidents[i, 'TOT_EXPER'])
+
+        tmp     <- round(mean(partial$MINE_EXPER, na.rm=TRUE),2)
+        if(is.nan(tmp)) {
+            partial <- subset(accidents, TOT_EXPER == round(accidents[i, 'TOT_EXPER'], 0))
+            tmp <- round(mean(partial$MINE_EXPER, na.rm=TRUE),2)
+        }
+        accidents[i, 'MINE_EXPER'] <- tmp
+        accidents$MINE_EXPER.isbad[i]  <- 1
+
+        tmp     <- round(mean(partial$JOB_EXPER, na.rm=TRUE),2)
+        if(is.nan(tmp)) {
+            partial <- subset(accidents, TOT_EXPER == round(accidents[i, 'TOT_EXPER'], 0))
+            tmp <- round(mean(partial$JOB_EXPER, na.rm=TRUE),2)
+        }
+        accidents[i, 'JOB_EXPER']  <- tmp
+        accidents$JOB_EXPER.isbad[i]  <- 1
+    }
+}
+
+accidents$day      <- yday(as.Date(accidents$ACCIDENT_DT))
+accidents$weekdays <- weekdays(as.Date(accidents$ACCIDENT_DT))
+accidents          <- accidents[-which(colnames(accidents) %in% c('ACCIDENT_DT', 'RETURN_TO_WORK_DT', 'INVEST_BEGIN_DT'))]
+```
+
+```{R message=FALSE, warning=FALSE}
+chackNA()
+```
+
+# number of data after NA removed
+```{R message=FALSE, warning=FALSE}
+length(na.omit(accidents)$IsContract)/length(accidents$IsContract)
+```
+
+# store as csv for future use
+```{R}
+write.csv(na.omit(accidents), 'accidents.cleaned2.csv')
+```
+
+# clean memory
+```{R message=FALSE, warning=FALSE}
+rm(list = ls())
+```

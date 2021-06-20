@@ -1,0 +1,809 @@
+---
+title: 'Mining accidents part 1: Exploratory Data Analytics'
+output:
+  html_document: default
+  html_notebook: default
+  pdf_document: default
+---
+
+# Load data
+
+## Load R packages
+```{R message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggalt)
+library(treemapify)
+library(ggalt)
+library(Rfast)
+library(dplyr)
+library(scales)
+library(lubridate)
+library(gridExtra)
+library(grid)
+library(psych)
+library(maps)
+```
+
+## Load data
+```{R message=FALSE, warning=FALSE}
+data.accidents <- read.csv("DATA/us_data.csv")
+# accidents <- read.csv("DATA/us_data.csv")
+accidents <- data.accidents
+```
+
+
+# data remove
+
+## remove data IDs 
+```{R message=FALSE, warning=FALSE}
+accidents <- accidents[-which(colnames(accidents)=="MINE_ID")]
+accidents <- accidents[-which(colnames(accidents)=="NARRATIVE")]
+accidents <- accidents[-which(colnames(accidents)=="CONTROLLER_ID")]
+accidents <- accidents[-which(colnames(accidents)=="OPERATOR_ID")]
+accidents <- accidents[-which(colnames(accidents)=="SUBUNIT_CD")]
+accidents <- accidents[-which(colnames(accidents)=="DEGREE_INJURY_CD")]
+accidents <- accidents[-which(colnames(accidents)=="UG_LOCATION_CD")]
+accidents <- accidents[-which(colnames(accidents)=="UG_MINING_METHOD_CD")]
+accidents <- accidents[-which(colnames(accidents)=="MINING_EQUIP_CD")]
+accidents <- accidents[-which(colnames(accidents)=="EQUIP_MFR_CD")]
+accidents <- accidents[-which(colnames(accidents)=="CLASSIFICATION_CD")]
+accidents <- accidents[-which(colnames(accidents)=="ACCIDENT_TYPE_CD")]
+accidents <- accidents[-which(colnames(accidents)=="IMMED_NOTIFY_CD")]
+accidents <- accidents[-which(colnames(accidents)=="OCCUPATION_CD")]
+accidents <- accidents[-which(colnames(accidents)=="ACTIVITY_CD")]
+accidents <- accidents[-which(colnames(accidents)=="INJURY_SOURCE_CD")]
+accidents <- accidents[-which(colnames(accidents)=="NATURE_INJURY_CD")]
+accidents <- accidents[-which(colnames(accidents)=="INJ_BODY_PART_CD")]
+accidents <- accidents[-which(colnames(accidents)=="EQUIP_MODEL_NO")]
+```
+
+## delete information may not usefull
+```{R message=FALSE, warning=FALSE}
+accidents <- accidents[-which(colnames(accidents)=="CLOSED_DOC_NO")]
+accidents <- accidents[-which(colnames(accidents)=="DOCUMENT_NO")]
+accidents <- accidents[-which(colnames(accidents)=="CONTROLLER_NAME")]
+accidents <- accidents[-which(colnames(accidents)=="OPERATOR_NAME")]
+accidents <- accidents[-which(colnames(accidents)=="INVEST_BEGIN_DT")]
+accidents <- accidents[-which(colnames(accidents)=="OCCUPATION")]
+```
+
+## We use calender year so delete Fiscal Year date data
+```{R message=FALSE, warning=FALSE}
+accidents <- accidents[-which(colnames(accidents)=="FISCAL_YR")]
+accidents <- accidents[-which(colnames(accidents)=="FISCAL_QTR")]
+```
+## Remoce cal qtr and year as we can extract from accident date
+```{R message=FALSE, warning=FALSE}
+accidents <- accidents[-which(colnames(accidents)=="CAL_QTR")]
+accidents <- accidents[-which(colnames(accidents)=="CAL_YR")]
+```
+
+# Data transform
+
+## Change character to more meaningful representation
+```{R message=FALSE, warning=FALSE}
+accidents$COAL_METAL_IND[accidents$COAL_METAL_IND == "C"] <- 'Coal'
+accidents$COAL_METAL_IND[accidents$COAL_METAL_IND == "M"] <- 'Metal'
+
+# Change state ID to state name
+data.fips <- read.csv("DATA/fips_state.csv", fileEncoding="UTF-8-BOM")
+i = 1
+indexs <- accidents$FIPS_STATE_CD
+tmp <- c()
+for(j in 1:length(indexs)) {
+    tmp[i] <- data.fips$state[binary_search(data.fips$code, indexs[j], index=TRUE)]
+    i <- i + 1
+}
+accidents$FIPS_STATE_CD <- tmp
+accidents  <- rename(accidents , FIPS_STATE=FIPS_STATE_CD)
+
+#  Use Yes or No to permanently transferred or terminated
+accidents$TRANS_TERM[accidents$TRANS_TERM == 'Y']      <- 'Yes'
+accidents$TRANS_TERM[accidents$TRANS_TERM == 'N']      <- 'No'
+#  Blank to NO VALUE FOUND
+accidents$TRANS_TERM[accidents$TRANS_TERM == '']       <- 'NO VALUE FOUND'
+accidents$ACTIVITY[accidents$ACTIVITY == '']           <- 'NO VALUE FOUND'
+accidents$DEGREE_INJURY[accidents$DEGREE_INJURY == ''] <- 'NO VALUE FOUND'
+accidents$CONTRACTOR_ID                                <-  accidents$CONTRACTOR_ID != ''
+accidents                                              <- rename(accidents , IS_CONTRACTOR=CONTRACTOR_ID)
+accidents                                              <- rename(accidents , BACKWORK=RETURN_TO_WORK_DT)
+accidents$BACKWORK[which(accidents$BACKWORK != '')]    <- 'APPLY'
+accidents$BACKWORK[which(accidents$BACKWORK == '')]    <- 'NOT APPLY'
+```
+
+## Change data to NAs
+```{R message=FALSE, warning=FALSE}
+# time cannot larget than > 2400
+accidents$ACCIDENT_TIME[accidents$ACCIDENT_TIME > 2400 ]       <- NA
+accidents$SHIFT_BEGIN_TIME[accidents$SHIFT_BEGIN_TIME > 2400]  <- NA
+```
+
+## Filling NA data
+Some NAs can be filled based on information provided by other column,
+```{R message=FALSE, warning=FALSE}
+# Death, no day lost and restrict 6000 === DEATH
+accidents$SCHEDULE_CHARGE[which(accidents$IMMED_NOTIFY == 'DEATH')]                           <-  6000
+accidents$IMMED_NOTIFY[which(accidents$SCHEDULE_CHARGE == 6000)]                              <- 'DEATH'
+accidents$DAYS_RESTRICT[which(accidents$SCHEDULE_CHARGE == 6000)]                             <- 0
+accidents$DAYS_LOST[which(accidents$SCHEDULE_CHARGE == 6000)]                                 <- 0
+accidents$TRANS_TERM[which(accidents$SCHEDULE_CHARGE == 6000)]                                <- 'No'
+accidents$SCHEDULE_CHARGE[which(accidents$DEGREE_INJURY == 'DEATH')]                          <-  6000
+accidents$DAYS_RESTRICT[which(accidents$DEGREE_INJURY == "NO DYS AWY FRM WRK,NO RSTR ACT")]   <- 0
+accidents$DAYS_LOST[which(accidents$DEGREE_INJURY == "NO DYS AWY FRM WRK,NO RSTR ACT")]       <- 0
+accidents$DAYS_LOST[which(accidents$DEGREE_INJURY == 'DAYS RESTRICTED ACTIVITY ONLY')]        <- 0
+accidents$DAYS_RESTRICT[which(accidents$DEGREE_INJURY == 'DAYS AWAY FROM WORK ONLY')]         <- 0
+```
+
+## Analyze the number of NA each variables
+```{R message=FALSE, warning=FALSE}
+NAs <- apply(is.na(accidents), 2, sum)
+NAs[NAs>0]
+```
+
+We can see that there are many NA expecially SCHEDULE_CHARGE
+
+```{R message=FALSE, warning=FALSE}
+NAs <- rbind(apply(is.na(accidents[which(accidents$ACCIDENT_TYPE == 'ACC TYPE, WITHOUT INJURIES'),]), 2, sum),
+           apply(is.na(accidents[which(accidents$ACCIDENT_TYPE != 'ACC TYPE, WITHOUT INJURIES'),]), 2, sum))
+rownames(NAs) <- c('NO-INJURIES','INJURIES')
+t(NAs[,colSums(NAs)>0])
+```
+
+```{R message=FALSE, warning=FALSE}
+length(accidents[which(accidents$ACCIDENT_TYPE == 'ACC TYPE, WITHOUT INJURIES'),]$ACCIDENT_TYPE)
+```
+
+Based o result above, all *_EXPER datas were NAs'. Accounted for 65%, 71% and 72% of NA datas. We can fill SCHEDULE_CHARGE, DAYS_RESTRICT and DAYS_LOST as 0 since no injureis. And if we look at the each data column
+
+```{R message=FALSE, warning=FALSE, fig.width=10}
+tmp<-accidents[which(accidents$ACCIDENT_TYPE == 'ACC TYPE, WITHOUT INJURIES'),]
+summary(factor(tmp$SCHEDULE_CHARGE))
+summary(factor(tmp$DAYS_LOST))
+summary(factor(tmp$DAYS_RESTRICT))
+```
+We can see that no Charge in days lost, days of restricted work activity, Actual days lost from work, so we will fill SCHEDULE_CHARGE, DAYS_RESTRICT and DAYS_LOST NA datas with 0
+
+```{R message=FALSE, warning=FALSE, fig.width=10}
+accidents$DAYS_RESTRICT[which(accidents$ACCIDENT_TYPE == 'ACC TYPE, WITHOUT INJURIES')]    <- 0
+accidents$DAYS_LOST[which(accidents$ACCIDENT_TYPE == 'ACC TYPE, WITHOUT INJURIES')]        <- 0
+accidents$SCHEDULE_CHARGE[which(accidents$ACCIDENT_TYPE == 'ACC TYPE, WITHOUT INJURIES')]  <- 0
+accidents$TRANS_TERM[which(accidents$ACCIDENT_TYPE == 'ACC TYPE, WITHOUT INJURIES')]       <- 'No'
+```
+
+```{R message=FALSE, warning=FALSE, fig.width=10}
+NAs <- apply(is.na(accidents), 2, sum)
+NAs[NAs>0]
+```
+
+## Change data type for ploting
+```{R}
+accidents <- within(accidents, {
+     SUBUNIT          <- factor(SUBUNIT          , levels=names(sort(table(SUBUNIT), decreasing=FALSE)))
+     DEGREE_INJURY    <- factor(DEGREE_INJURY    , levels=names(sort(table(DEGREE_INJURY), decreasing=FALSE)))
+     FIPS_STATE       <- factor(FIPS_STATE       , levels=names(sort(table(FIPS_STATE), decreasing=FALSE)))
+     UG_LOCATION      <- factor(UG_LOCATION      , levels=names(sort(table(UG_LOCATION), decreasing=FALSE)))
+     UG_MINING_METHOD <- factor(UG_MINING_METHOD , levels=names(sort(table(UG_MINING_METHOD), decreasing=FALSE)))
+     MINING_EQUIP     <- factor(MINING_EQUIP     , levels=names(sort(table(MINING_EQUIP), decreasing=FALSE)))
+     EQUIP_MFR_NAME   <- factor(EQUIP_MFR_NAME   , levels=names(sort(table(EQUIP_MFR_NAME), decreasing=FALSE)))
+     CLASSIFICATION   <- factor(CLASSIFICATION   , levels=names(sort(table(CLASSIFICATION), decreasing=FALSE)))
+     ACCIDENT_TYPE    <- factor(ACCIDENT_TYPE    , levels=names(sort(table(ACCIDENT_TYPE), decreasing=FALSE)))
+     ACTIVITY         <- factor(ACTIVITY         , levels=names(sort(table(ACTIVITY),   decreasing=FALSE)))
+     INJURY_SOURCE    <- factor(INJURY_SOURCE    , levels=names(sort(table(INJURY_SOURCE), decreasing=FALSE)))
+     NATURE_INJURY    <- factor(NATURE_INJURY    , levels=names(sort(table(NATURE_INJURY), decreasing=FALSE)))
+     INJ_BODY_PART    <- factor(INJ_BODY_PART    , levels=names(sort(table(INJ_BODY_PART), decreasing=FALSE)))
+     TRANS_TERM       <- factor(TRANS_TERM       , levels=names(sort(table(TRANS_TERM), decreasing=FALSE)))
+     IMMED_NOTIFY     <- factor(IMMED_NOTIFY     , levels=names(sort(table(IMMED_NOTIFY), decreasing=FALSE)))
+     COAL_METAL_IND   <- factor(COAL_METAL_IND   , levels=names(sort(table(COAL_METAL_IND), decreasing=FALSE)))
+     BACKWORK         <- factor(BACKWORK)
+     TOT_EXPER        <- as.numeric(TOT_EXPER)
+     MINE_EXPER       <- as.numeric(MINE_EXPER)
+     JOB_EXPER        <- as.numeric(JOB_EXPER)
+     ACCIDENT_TIME    <- as.numeric(ACCIDENT_TIME)
+     SHIFT_BEGIN_TIME <- as.numeric(SHIFT_BEGIN_TIME)
+     NO_INJURIES      <- as.numeric(NO_INJURIES)
+     ACCIDENT_DT      <- as.POSIXct(ACCIDENT_DT, format="%d/%m/%Y")
+})
+```
+
+# Analyzing accidents respect to Date and time
+
+All graphs are Right (positive) skewed data, use Root, log, or Reciprocal to tranform the data.
+
+```{R message=FALSE, warning=FALSE, fig.width=10}
+accidents.date <- accidents
+accidents.date$year <- year(accidents.date$ACCIDENT_DT)
+p1 <- ggplot(data = accidents.date, aes(x=year)) + 
+     geom_bar(aes(y=..count..), colour="white", fill="#003f5c") +
+     ggtitle("Accidents by year")
+
+accidents.date$quarter <- quarter(accidents.date$ACCIDENT_DT)
+accidents.date$quarter <- factor(accidents.date$quarter)
+p2 <- ggplot(data = accidents.date, aes(x=quarter)) + 
+    geom_bar(aes(y=..count..), colour="white", fill="#003f5c") +
+     ggtitle("Accidents by Quarter")
+
+accidents.date$month <- month.abb[month(accidents.date$ACCIDENT_DT)]
+accidents.date$month <- factor(accidents.date$month, levels = c("Jan","Feb","Mar", "Apr","May","Jun", "Jul","Aug","Sep", "Oct","Nov","Dec"))
+p3 <- ggplot(data = accidents.date, aes(x=month)) + 
+     geom_bar(aes(y=..count..), colour="white", fill="#003f5c") +
+     ggtitle("Accidents by Month")
+
+accidents.date$weekdays <- weekdays(accidents.date$ACCIDENT_DT)
+accidents.date$weekdays <- factor(accidents.date$weekdays, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+p4 <- ggplot(data = accidents.date, aes(x=weekdays)) + 
+     geom_bar(aes(y=..count..), colour="white", fill="#003f5c") +
+     ggtitle("Accidents by Weekdays")
+
+p5 <- ggplot(data = accidents.date, aes(x=ACCIDENT_DT)) + 
+     geom_bar(aes(y=..count..), colour="#003f5c", fill="#003f5c") +
+     ggtitle("Accidents by Day") +
+     xlab('Day')
+
+p6 <- ggplot(data = accidents.date, aes(x=ACCIDENT_TIME)) + 
+    geom_histogram(aes(y=..count..), colour="white", fill="#003f5c", binwidth = 100) +
+    ggtitle("Accidents by Time") +
+    xlab("Time(1025 = 10:25)")
+
+grid.arrange(p1, p2, p3 , p4, p5, p6, ncol=2, nrow=3)
+```
+There is a positive skew trend on accidents - accidents get reduced each year. The 2015 accidents were significantly less than previous year because the data ends on 2015-05-09, so only half of the 2015 data were collected.
+We see most accident occurred 7 o'clock - 16 o'clock, which is daytime. We can check this by Shift begin time.
+
+```{R message=FALSE, warning=FALSE, fig.width=10}
+accidents.date$DAY_NIGHT_SHIFT <- "NIGHT"
+accidents.date$DAY_NIGHT_SHIFT[between(accidents$SHIFT_BEGIN_TIME, 400, 1500)] <- "DAY"
+ggplot(accidents.date, aes(x=DAY_NIGHT_SHIFT ))    + 
+     geom_bar(fill = "#003f5c")                    +
+     ggtitle("Accidents by days shift period")                +
+     xlab("Work period")
+```
+
+We see that most workers work at day time. Relative more accidents occur.
+
+#### Lets explory which variables cause accidents reduced
+```{R message=FALSE, warning=FALSE, fig.width=10}
+accidents.date$month <- month(accidents.date$ACCIDENT_DT)
+tmp <- group_by(accidents.date, year, month, SUBUNIT)
+tmp <- summarise(tmp , COUNT_ACCIDENTS = sum(NO_INJURIES*0+1, na.rm = T))
+tmp$year <- tmp$year + (tmp$month - 1)/12
+ggplot(data = tmp, mapping = aes(x = year,month , y = COUNT_ACCIDENTS, color = SUBUNIT)) +
+      geom_point() +
+      geom_line()  +
+      geom_smooth() +
+      ggtitle('Accidents by year spilt by subunit')
+```
+
+Number of accidents drooped because there's significantly decrease in `underground`, `strip, quary and open pit` and `Mill operation preperation plant`.
+
+Analyze why there's significantly decrease in number of accidents
+
+```{R message=FALSE, warning=FALSE, fig.width=9, fig.height=10}
+# Subset data to only UNDERGROUND, STRIP, QUARY, OPEN PIT and  MILL OPERATION/PREPARATION PLANT
+accidents.date.USM <- accidents.date[which(
+     accidents.date$SUBUNIT == "UNDERGROUND" | 
+     accidents.date$SUBUNIT == "STRIP, QUARY, OPEN PIT" | 
+     accidents.date$SUBUNIT == "MILL OPERATION/PREPARATION PLANT"
+),]
+tmp <- group_by(accidents.date.USM, year, month, CLASSIFICATION)
+tmp <- summarise(tmp , COUNT_ACCIDENTS = sum(NO_INJURIES*0+1, na.rm = T))
+tmp$year <- tmp$year + (tmp$month - 1)/12
+ggplot(data = tmp, mapping = aes(x = year,month , y = COUNT_ACCIDENTS, color = CLASSIFICATION)) +
+     geom_point() +
+     geom_line() +
+     geom_smooth() +
+     ggtitle('Accidents by year spilt by calssification') +
+     theme(
+        legend.position="bottom", legend.direction = 'horizontal',
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.title = element_text(, size = 9),
+        legend.text = element_text(, size = 8)
+    ) 
+
+length(accidents.date.USM$IS_CONTRACTOR) / length(accidents.date$IS_CONTRACTOR)
+```
+`93.6%` of accidents occurred in `underground`, `strip, quary and open pit` and `Mill operation preperation plant` mining. And from the graph above we can see that it falls into `HANDLING`, `MACHINERY`, `POWERED HAULAGE` and `FALL`
+
+Analysis CLASSIFICATION against ACCIDENT_TYPE
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+accidents.date.USM$ACCIDENT_TYPE_GROUPED <- as.character(accidents.date.USM$ACCIDENT_TYPE)
+
+# Group some data into same category
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('STRUCK', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]       <- "STRUCK"
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('FALL', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]         <- "FALL"
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('OVER-EXERTION', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]<- "OVER-EXERTION"
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('OVR-EXRTN', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]    <- "OVER-EXERTION"
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('OVREXRTN', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]     <- "OVER-EXERTION"
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('FLASH BURNS', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]  <- "FLASH BURNS(WELDING|ELECTRIC)"
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('CONTACT', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]      <- "CONTACT(ELEC|HEAT|COLD)"
+accidents.date.USM$ACCIDENT_TYPE_GROUPED[which(grepl('CONTCT', accidents.date.USM$ACCIDENT_TYPE_GROUPED, fixed = TRUE) == TRUE)]       <- "CONTACT(ELEC|HEAT|COLD)"
+
+tmp <- group_by(accidents.date.USM, CLASSIFICATION, ACCIDENT_TYPE_GROUPED)
+tmp <- summarise(tmp , TOTAL = sum(NO_INJURIES*0+1, na.rm = T))
+tmp <- tmp[which(
+     tmp$ACCIDENT_TYPE_GROUPED != "NO VALUE FOUND" & (
+     tmp$CLASSIFICATION == "HANDLING OF MATERIALS" | 
+     tmp$CLASSIFICATION == "SLIP OR FALL OF PERSON" | 
+     tmp$CLASSIFICATION == "FALL OF ROOF OR BACK" | 
+     tmp$CLASSIFICATION == "HANDTOOLS (NONPOWERED)" | 
+     tmp$CLASSIFICATION == "MACHINERY" |
+     tmp$CLASSIFICATION == "POWERED HAULAGE")
+),]
+ggplot(tmp , aes(CLASSIFICATION , ACCIDENT_TYPE_GROUPED, fill=TOTAL )) + 
+     geom_count(mapping = aes(size=TOTAL, color=TOTAL))+
+     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+     ggtitle('Accidents, classfication by accident type')
+```
+
+We can see that most people get involved into accident because people trying to move something too heavey, falling and struck by something. The main reason for this is likely to be insufficient safety awareness and lack of safety training. And due to safety certificates requirements and saftey protection in the work field. Then less accidents like falling, struck, and over exertion.
+
+# Analysis Activity, Injury source, Nature injury and Injury body parts.
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+accidents.injury <- accidents
+accidents.injury$BODY_PART <- as.character(accidents.injury$INJ_BODY_PART)
+accidents.injury$COUNT <- 1
+# remove rows were all NA
+accidents.injury <- accidents.injury[-which(
+     accidents.injury$ACTIVITY == "NO VALUE FOUND" &
+     accidents.injury$INJURY_SOURCE == "NO VALUE FOUND" & 
+     accidents.injury$NATURE_INJURY == "NO VALUE FOUND" & 
+     accidents.injury$INJ_BODY_PART == "NO VALUE FOUND" & 
+     accidents.injury$IMMED_NOTIFY == "NO VALUE FOUND"
+),]
+accidents.injury <- accidents.injury[-which(
+     accidents.injury$INJ_BODY_PART == "NO VALUE FOUND"
+),]
+
+ggplot(accidents.injury, aes(x=INJ_BODY_PART)) + 
+    geom_bar(fill = "#003f5c")            +
+    scale_y_continuous(labels = comma)    +
+    ggtitle("Accidents by body parts")    +
+    xlab("Underground Location")          +
+    coord_flip()
+```
+
+We see lots of categories, to get a clear view we can be grouped body parts into same category, 
+
+```{R message=FALSE, warning=FALSE, fig.width=10,  fig.heght=8}
+HEAD  <- c('SKULL', 'EAR(S) INTERNAL & HEARING', 'EAR(S) EXTERNAL', 'EAR(S) INTERNAL & EXTERNAL' ,'EYE(S) OPTIC NERVE/VISON', 'NOSE/NASAL PASSAGES/SINUS/SMELL', 'EAR(S) INTERNAL & HEARING', 'BRAIN', 'FACE,NEC', 'FACE, MULTIPLE PARTS', 'HEAD, MULTIPLE PARTS', 'HEAD,NEC', 'MULTIPLE PARTS', 'MOUTH/LIP/TEETH/TONGUE/THROAT/TASTE', 'JAW INCLUDE CHIN', 'SCALP')
+LEG   <- c('LEG, MULTIPLE PARTS', 'LOWER LEG/TIBIA/FIBULA', 'FOOT(NOT ANKLE/TOE)/TARSUS/METATARSUS', 'LEG, NEC', 'KNEE/PATELLA', 'TOE(S)/PHALANGES', 'ANKLE', 'THIGH/FEMUR', 'LOWER EXTREMITIES,NEC', 'LOWER EXTREMITIES, MULTIPLE PARTS')
+ARM   <- c('ARM, MULTIPLE PARTS', 'ARM,NEC', 'HAND (NOT WRIST OR FINGERS)', 'WRIST', 'FINGER(S)/THUMB', 'UPPER ARM/HUMERUS', 'SHOULDERS (COLLARBONE/CLAVICLE/SCAPULA)', 'ELBOW', 'FOREARM/ULNAR/RADIUS', 'UPPER EXTREMITIES, MULTIPLE', 'UPPER EXTREMITIES, NEC')
+BODY  <- c('CHEST (RIBS/BREAST BONE/CHEST ORGNS)', 'BODY SYSTEMS', 'ABDOMEN/INTERNAL ORGANS', 'BODY PARTS, NEC', 'TRUNK, MULTIPLE PARTS', 'TRUNK,NEC', 'HIPS (PELVIS/ORGANS/KIDNEYS/BUTTOCKS)')
+BACK  <- c('BACK (MUSCLES/SPINE/S-CORD/TAILBONE)')
+MULTI <- c('MULTIPLE PARTS (MORE THAN ONE MAJOR)')
+accidents.injury <- within(accidents.injury, {
+     BODY_PART[which((accidents.injury$BODY_PART %in% HEAD) == TRUE)] <- 'Head'
+     BODY_PART[which((accidents.injury$BODY_PART %in% LEG) == TRUE)]  <- 'Leg'
+     BODY_PART[which((accidents.injury$BODY_PART %in% ARM) == TRUE)]  <- 'Arm'
+     BODY_PART[which((accidents.injury$BODY_PART %in% BODY) == TRUE)] <- 'Body'
+     BODY_PART[which((accidents.injury$BODY_PART %in% BACK) == TRUE)] <- 'Back'
+     BODY_PART[which((accidents.injury$BODY_PART %in% MULTI) == TRUE)]<- 'Miltiple parts'
+     BODY_PART <- factor(BODY_PART   , levels=names(sort(table(BODY_PART), decreasing=FALSE)))
+})
+
+ggplot(accidents.injury, aes(x=BODY_PART)) + 
+     geom_bar(fill = "#003f5c")            +
+     scale_y_continuous(labels = comma)    +
+     ggtitle("Accidents by body parts(grouped)")    +
+     xlab("Underground Location")          +
+     coord_flip()
+
+tmp <- group_by(accidents.injury, BODY_PART, INJ_BODY_PART)
+tmp <- summarise(tmp , COUNT_ACCIDENTS = sum(COUNT))
+ggplot(tmp, aes(area = COUNT_ACCIDENTS , label = INJ_BODY_PART, subgroup = BODY_PART, fill = BODY_PART)) + 
+    geom_treemap() +
+    geom_treemap_subgroup_border() +
+    geom_treemap_subgroup_text(place = "centre", grow = F, colour = "White", fontface = "italic", min.size = 0) +
+    geom_treemap_text(colour = "black", place = "centre", reflow = T, alpha=0.5) +
+    ggtitle('Accidents, grouped body parts by body parts')
+```
+
+### activity by body parts
+
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+tmp <- group_by(accidents.injury, ACTIVITY, BODY_PART, INJ_BODY_PART)
+tmp <- summarise(tmp , COUNT_ACCIDENTS = sum(COUNT))
+tmp <- tmp[which(tmp$BODY_PART != 'NO VALUE FOUND'),]
+tmp <- tmp[which(tmp$COUNT_ACCIDENTS > 100),]
+ggplot(tmp, aes(ACTIVITY, INJ_BODY_PART)) + 
+     geom_count(mapping = aes(size=COUNT_ACCIDENTS, color=BODY_PART)) + 
+     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0.5), axis.text=element_text(size=8)) +
+     ggtitle('Accidents, activity by injury body parts') +
+     coord_flip()
+```
+We can see that with frequent larger than 100, `HANDLING SUPPLIES/MATERIALS`, `MACHINE MAINTENANCE/REPAIR`, `HAND TOOLS (NOT POWERED)`, `WALKING/RUNNING`, `GET ON/OFF EQUIPMENT/MACHINES` cause Will cause damage to all part of the body
+
+and `FINGER(S)/THUMB`, `BACK`, `KNEE/PATELLA`, `MULTIPLE PARTS` injury, will cause by almost all activities.
+
+Handling supplies have a high chance to cause back injury. And finger injury likely caused by machine maintenance, use hand tool and handling object.
+
+#  Total Experience, Mine Experience, Job Experience
+```{R message=FALSE, warning=FALSE, fig.width=10}
+p1 <- ggplot(accidents, aes(x=TOT_EXPER))                               + 
+          geom_histogram(aes(y=..density..), bins=100, fill = "#003f5c")+
+          geom_density()                                                +
+          ggtitle("Accidents by Total Experience")                        +
+          xlab("Job Experience")                                        +
+          xlim(0, 50)                                                   +
+          annotate("text", x = 15, y = 0.1, label = "Experence spike at whole year(integer), especially at 10 scale years ")
+
+p2 <- ggplot(mutate(accidents, TOT_EXPER = scale(sqrt(TOT_EXPER), center = TRUE, scale = TRUE)), aes(x=TOT_EXPER)) +
+          geom_histogram(aes(y=..density..), bins=50, fill = "#003f5c") +
+          geom_density()                                                +
+          ggtitle("Accidents by Total Experience(sqrt)")                +
+          xlab("Job Experience")                                        +
+          xlim(0, 5)                                                   
+
+grid.arrange(p1, p2 , ncol=1, nrow=2)
+
+p3 <- ggplot(accidents, aes(x=MINE_EXPER))                               + 
+           geom_histogram(aes(y=..density..), bins=100, fill = "#003f5c")+
+           geom_density()                                                +
+           ggtitle("Accidents by Mining Experience")                     +
+           xlab("Job Experience")                                        +
+           xlim(0, 50)
+
+p4 <- ggplot(mutate(accidents, MINE_EXPER = scale(log(MINE_EXPER), center = TRUE, scale = TRUE)), aes(x=MINE_EXPER)) + 
+           geom_histogram(aes(y=..density..), bins=50, fill = "#003f5c")        +
+           geom_density()                                                       +
+           ggtitle("Accidents by Mining Experience(log)")                       +
+           xlab("Job Experience")                                               +
+           xlim(0, 5)
+
+grid.arrange(p3, p4 , ncol=1, nrow=2)
+
+p5 <- ggplot(accidents, aes(x=JOB_EXPER))                               + 
+          geom_histogram(aes(y=..density..), bins=100, fill = "#003f5c")+
+          geom_density()                                                +
+          ggtitle("Accidents by Job Experience")                        +
+          xlab("Job Experience")                                        +
+          xlim(0, 50)
+
+p6 <- ggplot(mutate(accidents, JOB_EXPER = scale(log(TOT_EXPER), center = TRUE, scale = TRUE)), aes(x=JOB_EXPER)) + 
+          geom_histogram(aes(y=..density..), bins=50, fill = "#003f5c")       +
+          geom_density()                                                      +
+          ggtitle("Accidents by Job Experience(log)")                         +
+          xlab("Job Experience")                                              +
+          xlim(0, 5)
+grid.arrange(p5, p6 , ncol=1, nrow=2)
+```
+
+Experences variables are all right-skewed, means people with more experence less likely invloving in accidents. After we apply transformation we can see that most accidents happend to people who only have 0 - 5 year of experence.
+
+#### Exploring relationships between Experence and DEGREE_INJURY
+
+We want to analyze if there’s a relation between degree of injury and experence.
+We will combine data into same category, as DEATH_DISABLTY, OTHER, INJURIES, DAYS_LOST_RESTRICT, ILLNESS and NO_DAYS_LOST_RESTRICT.
+We will move data that is ACCIDENT ONLY since all *_experence were NA. And NO VALUE FOUND.
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=15}
+tmp <- accidents
+tmp$DEGREE_INJURY <- as.character(tmp$DEGREE_INJURY)
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'FATALITY')]                      <- 'DEATH_DISABLTY'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'PERM TOT OR PERM PRTL DISABLTY')]<- 'DEATH_DISABLTY'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'ALL OTHER CASES (INCL 1ST AID)')]<- 'OTHER'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'INJURIES DUE TO NATURAL CAUSES')]<- 'INJURIES'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'INJURIES INVOLVNG NONEMPLOYEES')]<- 'INJURIES'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'DAYS AWAY FROM WORK ONLY')]      <- 'DAYS_LOST_RESTRICT'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'DAYS RESTRICTED ACTIVITY ONLY')] <- 'DAYS_LOST_RESTRICT'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'DYS AWY FRM WRK & RESTRCTD ACT')]<- 'DAYS_LOST_RESTRICT'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'OCCUPATNAL ILLNESS NOT DEG 1-6')]<- 'ILLNESS'
+tmp$DEGREE_INJURY[which(tmp$DEGREE_INJURY == 'NO DYS AWY FRM WRK,NO RSTR ACT')]<- 'NO_DAYS_LOST_RESTRICT'
+tmp <- tmp[which(tmp$DEGREE_INJURY != 'ACCIDENT ONLY'),]
+tmp <- tmp[-which(tmp$DEGREE_INJURY == 'NO VALUE FOUND'),]
+tmp$DEGREE_INJURY <- factor(tmp$DEGREE_INJURY)
+
+p1 <- ggplot(data = tmp, 
+      mapping = aes(x = DEGREE_INJURY)) +
+      geom_boxplot( mapping = aes(y = TOT_EXPER)) + 
+      ggtitle("Total Experience among Each Level of Degree Injury Level") +
+      ylab("Total Experience")                    +
+      xlab("Degree of Injury")
+
+p2 <- ggplot(data = tmp, 
+      mapping = aes(x = DEGREE_INJURY)) +
+      geom_boxplot( mapping = aes(y = JOB_EXPER)) + 
+      ggtitle("Mine Experience among Each Level of Degree Injury Level") +
+      xlab("Mining Experience")                   +
+      ylab("Degree of Injury")
+
+p3 <- ggplot(data = tmp, 
+      mapping = aes(x = DEGREE_INJURY)) +
+      geom_boxplot( mapping = aes(y = MINE_EXPER))+ 
+      ggtitle("Job Experience among Each Level of Degree Injury Level") +
+      xlab("Job Experience")                      +
+      ylab("Degree of Injury")
+grid.arrange(p1, p2, p3, ncol=1, nrow=3)
+```
+
+ILLNESS has significalty higher IQR than other, we can category data into illness and accident to check why. We can use density plot to check the shift of that graph.
+
+```{R message=FALSE, warning=FALSE, fig.width=10}
+tmp <- mutate(tmp, TOT_EXPER = scale(sqrt(TOT_EXPER), center = TRUE, scale = TRUE))
+ggplot(tmp, aes(x=TOT_EXPER)) +
+    geom_density(data=subset(tmp, DEGREE_INJURY == 'INJURIES'), color="#e8ded2", fill="#e8ded2", alpha=0.4)  +
+    geom_density(data=subset(tmp, DEGREE_INJURY != 'INJURIES'), color="#056676", fill="#056676",  alpha=0.5) +
+    ggtitle("Accidents by Total Experience(sqrt)")                +
+    xlab("Job Experience")                                        +
+    xlim(0, 5)
+```
+We can see that ILLNESS does not follow `most accidents 0 - 5 year of experence`, slightly shift to the right. This might due to immunity level drops as age increase. This might due to immunity level drops as age increase.
+
+# Day lost, Day restricted
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+accidents.lost <- accidents[-which(accidents$SCHEDULE_CHARGE == 6000),] # remove DEATH
+p1 <- ggplot(data = accidents.lost, aes(x=ACCIDENT_DT, y=DAYS_LOST)) + 
+      geom_point() + 
+      labs(color="Return to Work")+
+      ggtitle('Days restricted by time')
+
+p2 <- ggplot(data = accidents.lost, aes(x=ACCIDENT_DT, y=DAYS_RESTRICT)) + 
+      geom_point() + 
+      labs(color="Return to Work") +
+      ggtitle('Days restricted by time')
+
+grid.arrange(p1,p2, nrow=2,ncol=1)
+```
+
+Date lost and accident date forms a special subgroup when data lost > 150. This might due employee diecded not back to work or company force them to take a break.
+
+We can check this by is employ back to work or not
+
+```{R message=FALSE, warning=FALSE, fig.width=10}
+ggplot(data = accidents.lost, aes(x=ACCIDENT_DT, y=DAYS_LOST, color=factor(BACKWORK))) + 
+      geom_point() + 
+      labs(color="Return to Work") + 
+      ggtitle('Days Lost by time')
+```
+
+Some patterns match in 2000, 2001, 2014
+
+### Day lost and Total experence
+```{R message=FALSE, warning=FALSE, fig.width=10}
+accident.lost <- accidents[-which(accidents$SCHEDULE_CHARGE == 6000),] # remove DEATH
+ggplot(data = accident.lost, aes(x=TOT_EXPER, y=DAYS_LOST)) + 
+      geom_point() + 
+      ggtitle('Experence by days lost')
+```
+
+There seems be a trend on number of days lost in range above 90 - 100, that as experence increase, there's a significantly decrease in day lost(above 90 - 100). To get a clear view on the data we can remove experence that is discret, as people tend to write their experience in integer format.
+
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+accident.lost.floot <- subset(accident.lost, !(TOT_EXPER %in% c(1:60))) %>%
+     subset(TOT_EXPER < 50) %>%
+     subset(DAYS_LOST < 400)
+
+p1 <- ggplot(data = accident.lost.floot  , aes(x=TOT_EXPER, y=DAYS_LOST)) + 
+     geom_point(alpha=1/25, position=position_jitter(h=0), color='orange') +
+     ggtitle('Count accidents, Experence range by days lost range')
+
+accident.lost.floot$DAYS_LOST_RANGE <- cut(accident.lost.floot$DAYS_LOST, breaks=seq(0, 375, by=5), include.lowest=T, labels = seq(0, 370, by=5),right = TRUE)
+accident.lost.floot$TOT_EXP_RANGE <- cut(accident.lost.floot$TOT_EXPER, breaks=seq(0, 50, by=1), include.lowest=T, labels = seq(0, 49, by=1),right = TRUE)
+tmp <- group_by(accident.lost.floot, TOT_EXP_RANGE, DAYS_LOST_RANGE) %>%
+     summarise(TOTAL=n())
+p2 <- ggplot(data = na.omit(tmp[which(tmp$TOTAL >7),]), aes(x=TOT_EXP_RANGE, y=DAYS_LOST_RANGE, fill=log(TOTAL))) + 
+    geom_tile() + 
+    scale_fill_gradient(low="#F1FFFC", high="#003f5c") + 
+    theme(panel.background = element_rect(fill = 'white')) +
+    ggtitle('Count accidents, Experence range by days lost range')
+
+grid.arrange(p1,p2, nrow=2,ncol=1)
+```
+
+# Accidents by USA state
+```{R message=FALSE, warning=FALSE, fig.height=10, fig.width=10}
+ggplot(data= accidents, mapping = aes(x=FIPS_STATE)) + 
+    geom_bar(aes( fill='#003f5c')) +
+    coord_flip() +
+    geom_text(stat='count', aes(label = ..count..), hjust = -0.5, size = 3, position = position_dodge(width = 1), inherit.aes = TRUE) +
+    ggtitle("Accidents by USA state 2000-2015") +
+    ylab("Number of accidents") + xlab("USA state")
+```
+
+To get a clear view, we can use the `map_data` provided by libraries.
+
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=7}
+# Get long and lat data from map data
+state <- map_data('state')
+virginIslands <- map_data("world", "virgin islands")
+puertoRico <- map_data("world", "puerto rico")
+Alaska <- subset( map_data("world"), subregion == "Alaska")
+
+accidents.state <- accidents %>%
+     group_by(FIPS_STATE) %>%
+     summarise(TOTAL = n()) %>%
+     mutate(FIPS_STATE = tolower(FIPS_STATE)) %>%
+     mutate(FIPS_STATE = ifelse(FIPS_STATE == "u.s. virgin islands", "Virgin Islands", FIPS_STATE)) 
+
+accidents.state.usa <- merge(accidents.state, state, by.x = "FIPS_STATE", by.y="region")
+accidents.state.usa <- accidents.state.usa[order(accidents.state.usa$order),]
+
+accidents.state.VI <- merge(accidents.state, virginIslands, by.x = "FIPS_STATE", by.y="region")%>%
+     subset(group > 3)
+accidents.state.VI <- accidents.state.VI[order(accidents.state.VI$order),]
+
+accidents.state.PR <- merge(accidents.state, mutate(puertoRico, region=tolower(region)), by.x = "FIPS_STATE", by.y="region")
+accidents.state.PR <- accidents.state.PR[order(accidents.state.PR$order),]
+
+accidents.state.alaska <- merge(accidents.state, mutate(Alaska, region='alaska'), by.x = "FIPS_STATE", by.y="region")
+
+# lab data
+accidents.state.lab <- accidents.state.usa %>%
+    group_by(FIPS_STATE)  %>%
+    summarise(
+        long = kmeans(long, centers=1)$centers,
+        lat = kmeans(lat, centers=1)$centers
+    )
+accidents.state.lab.VI <- accidents.state.VI %>%
+    group_by(FIPS_STATE)  %>%
+    summarise(
+        long = kmeans(long -40, centers=1)$centers,
+        lat = kmeans(lat, centers=1)$centers+1
+    )
+accidents.state.lab.PR <- accidents.state.PR %>%
+    group_by(FIPS_STATE)  %>%
+    summarise(
+        long = kmeans(long, centers=1)$centers,
+        lat = kmeans(lat, centers=1)$centers+1
+    )
+accidents.state.lab.alaska <- accidents.state.alaska %>%
+    group_by(FIPS_STATE)  %>%
+    summarise(
+        long = kmeans(long/2.3, centers=1)$centers,
+        lat = kmeans(lat/2.3, centers=1)$centers
+    )
+
+theme <- theme(panel.grid = element_blank(),
+     panel.background = element_rect(fill = '#458BD0'),
+     panel.border = element_blank(),
+     axis.title.x=element_blank(),
+     axis.text.x=element_blank(),
+     axis.ticks.x=element_blank(),
+     axis.title.y=element_blank(),
+     axis.text.y=element_blank(),
+     axis.ticks.y=element_blank()
+)
+
+# plot
+ggplot(accidents.state.usa) +
+    geom_polygon(data=accidents.state.usa, aes(x = long, y = lat, fill = TOTAL, group = group)) + 
+    geom_polygon(data=accidents.state.PR, aes(x = long, y = lat, fill = TOTAL, group = group)) +
+    geom_polygon(data=accidents.state.alaska, aes(x = long/2.3, y = lat/2.3, fill = TOTAL, group = group)) +
+    geom_polygon(data=accidents.state.VI, aes(x = long-40, y = lat, fill = TOTAL, group = group)) +
+    geom_text(aes(x = long, y = lat, label = FIPS_STATE), data = accidents.state.lab,  size = 2) +
+    geom_text(aes(x = long, y = lat, label = FIPS_STATE), data = accidents.state.lab.PR,  size = 3) +
+    geom_text(aes(x = long, y = lat, label = FIPS_STATE), data = accidents.state.lab.alaska,  size = 3) +
+    geom_text(aes(x = long, y = lat, label = FIPS_STATE), data = accidents.state.lab.VI,  size = 3) +
+    scale_fill_gradient(low="#F1FFFC", high="#003f5c") + xlim(-130,-50) + ylim(17, 50) + 
+    ggtitle("Accidents by FIPS State") +
+    theme
+```
+
+# Accidents involving Death
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+accident.death <- accidents.date[which(accidents$IMMED_NOTIFY == 'DEATH'),] %>%
+     subset(year < 2015)
+p1 <- ggplot(accident.death, aes(x= year,)) +
+    geom_bar(fill="#003f5c") + 
+    ggtitle("fatalities in mining") +
+    theme(
+        legend.position="bottom", legend.direction = 'horizontal',
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+    )
+
+p2 <- ggplot(subset(accident.death, COAL_METAL_IND =="Coal"), aes(x= year,)) +
+    geom_bar(fill="#003f5c") + 
+    ggtitle("fatalities in core mining") +
+    theme(
+        legend.position="bottom", legend.direction = 'horizontal',
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+    )
+
+p3 <- ggplot(subset(accident.death, COAL_METAL_IND !="Coal"), aes(x= year,)) +
+    geom_bar(fill="#003f5c") + 
+    ggtitle("fatalities in metal mining") +
+    theme(
+        legend.position="bottom", legend.direction = 'horizontal',
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+    )
+grid.arrange(p1, p2, p3， nrow=3,ncol=1)
+```
+
+We see that Death did not decrease over time. But total number of accidents decreased each year as we discovered above. This mean protection
+
+In 2001, 2006, 2010, the death toll slightly higher than other years in Coal mining.
+
+And in metal mining, number of deaths increased in 2000, 2007, 2014.
+
+### quick view on classification by fatalities
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=5}
+tmp <- accident.death %>%
+     group_by(CLASSIFICATION) %>%
+     summarise( TOTAL = n())
+
+tmp.nother <- accident.death %>%
+     group_by(CLASSIFICATION) %>%
+     summarise( TOTAL = n()) %>%
+     subset(CLASSIFICATION != "OTHER")
+
+tmp$fraction <- tmp$TOTAL / sum(tmp$TOTAL)
+tmp$ymax <- cumsum(tmp$fraction)
+tmp$ymin <- c(0, head(tmp$ymax, n=-1))
+
+p1 <- ggplot(tmp, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=CLASSIFICATION)) +
+    geom_rect() +
+    coord_polar(theta="y") +
+    xlim(c(-1, 4)) + 
+    theme_void() +
+    scale_fill_manual(values=c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", 
+                                "#673770", "#D3D93E", "#38333E", "#508578", "#D7C1B1", "#689030", "#AD6F3B", "#CD9BCD", 
+                                "#D14285", "#6DDE88", "#652926")) +
+     theme(
+          legend.title = element_text(, size = 8),
+          legend.text = element_text(, size = 6)
+     ) +
+     ggtitle("fatalities by classfication, 2000-2014") + 
+     theme(plot.title = element_text(hjust = 0.5))
+
+tmp.nother$fraction <- tmp.nother$TOTAL / sum(tmp.nother$TOTAL)
+tmp.nother$ymax <- cumsum(tmp.nother$fraction)
+tmp.nother$ymin <- c(0, head(tmp.nother$ymax, n=-1))
+
+p2 <- ggplot(tmp.nother, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=CLASSIFICATION)) +
+    geom_rect() +
+    coord_polar(theta="y") +
+    xlim(c(-1, 4)) + 
+    theme_void() +
+    scale_fill_manual(values=c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", "#3F4921", "#C0717C", "#CBD588", "#5F7FC7", 
+                                "#673770", "#D3D93E", "#38333E", "#508578", "#689030", "#AD6F3B", "#CD9BCD", 
+                                "#D14285", "#6DDE88", "#652926")) +
+    theme(legend.position = "none") +
+    ggtitle("all fatalities by classfication(no OTHER), 2000-2014") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, nrow=1, ncol=2, layout_matrix = rbind(c(1,1,1,1,2,2,2)))
+```
+
+The above graph shows powered haulage and machinery were responsible for a significant proportion of mining deaths. And Lost of fatalities were not classified
+
+Check why fatalities increased in certain year.
+
+```{R message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+accident.death$CLASSIFICATION <- factor(accident.death$CLASSIFICATION)
+
+accident.death.year <-  accident.death%>%
+     subset(COAL_METAL_IND =="Coal" ) %>%
+     group_by(year, CLASSIFICATION) %>%
+     summarise( TOTAL = n()) %>%
+     subset(CLASSIFICATION !="OTHER" )
+
+p1 <- ggplot(subset(accident.death.year, TOTAL>1), aes(y=TOTAL, x= year, fill=CLASSIFICATION)) +
+    geom_col(position = "dodge") + 
+    geom_text(aes(label = TOTAL), position = position_dodge(width=1), vjust = -0.5)+
+    ggtitle("fatalities in core mining by year") +
+    theme(
+        legend.position="bottom", legend.direction = 'horizontal',
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.title = element_text(, size = 8),
+        legend.text = element_text(, size = 6)
+    )
+
+accident.death.year <-  accident.death %>% 
+     subset(COAL_METAL_IND !="Coal" ) %>%
+     group_by(year, CLASSIFICATION) %>%
+     summarise( TOTAL = n()) %>%
+     subset(CLASSIFICATION !="OTHER" )
+
+p2 <- ggplot(subset(accident.death.year, TOTAL>1), aes(y=TOTAL, x= year, fill=CLASSIFICATION)) +
+    geom_col(position = "dodge") + 
+    geom_text(aes(label = TOTAL), position = position_dodge(width=1), vjust = -0.5)+
+    ggtitle("fatalities in metal mining by year") +
+    theme(
+        legend.position="bottom", legend.direction = 'horizontal',
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.title = element_text(, size = 8),
+        legend.text = element_text(, size = 6)
+    )
+grid.arrange(p1,p2, nrow=2,ncol=1)
+```
+Infrequent  Major accident - `coal dust explosion` caused many deaths in one accident, and it is why the reason why 2001, 2006, 2010  deaths increased in coal mining.
+
+There's a slight drop in powered haulage and machinery accidents each year, but there's also a increase trend in falling accidents.

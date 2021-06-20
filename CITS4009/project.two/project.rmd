@@ -1,0 +1,814 @@
+---
+title: "CITS4009 project2"
+author: "Cunjun Yin : 22249435"
+output:
+  html_document:
+    fig_width: 10
+    fig_height: 10
+---
+
+```{R message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ROCR)
+library(ROCit)
+library(party)
+library(rpart)
+library(RWeka)
+library(nnet)
+library(knitr)
+library(caret)
+library(gridExtra)
+library('e1071')
+library(xgboost)
+library(parallel)
+```
+
+# Introduction
+The data set used in the project is the cleaned version Mine Safety and Health Administration(MSHA) accidents from 2000-2015. This dataset contain addictional informtion like weekdays, day of year.
+
+
+# Load data
+```{R message=FALSE, warning=FALSE}
+accidents <- read.csv("accidents.cleaned.csv")
+```
+
+# Part 1 - Classification
+
+##  Data Pre-processing
+
+### Choose the response (target) variable
+Days away from work, Days restricted, Days charged, are outcomes when an accident happened. It can be used to indicate the severity of the injury. The higher the worse.
+
+By Predicting weather the accident will cause a lost to the company (Days away from work, Days restricted, Days charged), will be a useful factor for company to make future actions.
+
+The response variable(lost) is a new variable created by sum (Days away from work, Days restricted, Days charged), we classify lost to 0 and 1 to infinity
+```{R message=FALSE, warning=FALSE}
+predLabel      <- '[1]'
+predLabelFalse <- '[0]'
+
+indicator <- c("TOT_EXPER.isbad","MINE_EXPER.isbad","JOB_EXPER.isbad", 'DAYS_LOST_isBAD', 'DAYS_RESTRICT_isBAD', 'SCHEDULE_CHARGE_isBAD')
+accidents <- accidents %>% mutate(lost = SCHEDULE_CHARGE + DAYS_LOST + DAYS_RESTRICT) %>%
+             mutate(lost =  cut(lost, breaks=c(-1, 1, Inf), labels = c(predLabelFalse, predLabel)))
+accidents <- accidents[-which(colnames(accidents) %in% c(indicator, 'SCHEDULE_CHARGE', 'DAYS_LOST', 'DAYS_RESTRICT'))]
+accidents$DEGREE_INJURY <- ifelse(accidents$DEGREE_INJURY %in% c('DAYS AWAY FROM WORK ONLY', 'DAYS RESTRICTED ACTIVITY ONLY', 'DYS AWY FRM WRK & RESTRCTD ACT', 'NO DYS AWY FRM WRK,NO RSTR ACT'), 'ACCIDENT', accidents$DEGREE_INJURY)
+```
+
+```{R message=FALSE, warning=FALSE}
+table(accidents$lost)
+```
+
+```{R message=FALSE, warning=FALSE}
+round(prop.table(table(accidents$lost)), 3)
+```
+
+### Selecting dependent variables
+```{R}
+dependent <- colnames(accidents)[1:length(accidents)-1]
+dependent
+```
+
+##### Converting the  binary variables to factor and remember numerical variables.
+```{R}
+numVars <- c()
+for(d in dependent) {
+    if( length( unique(accidents[, d]) ) == 2  & (class(accidents[, d] ) %in% c("numeric", "integer")) ) accidents[, d] <- as.factor(accidents[, d])
+    if( class(accidents[, d] ) %in% c("numeric", "integer")) numVars <- c(numVars, d)
+    if( class(accidents[, d]) == "character") accidents[, d] <- as.factor(accidents[, d])
+}
+rm(d)
+```
+
+Specify the outcome variable
+```{R message=FALSE, warning=FALSE}
+outcome      <- 'lost'
+```
+
+Numerical variables 
+```{R message=FALSE, warning=FALSE}
+numVars
+```
+
+Categorical variables 
+```{R message=FALSE, warning=FALSE}
+catVars <- dependent[-which(dependent %in% c(numVars))]
+catVars
+```
+
+### Splitting the data
+
+Function for data splits
+```{R message=FALSE, warning=FALSE}
+data_spilt <- function(df, test_prob, cal_prob=0) {
+    set.seed(5423523)
+    tmp <- df
+    tmp$rgroup  <- runif(dim(tmp)[[1]])
+
+    dTrain      <- subset(tmp,rgroup<=test_prob)
+    dTest       <- subset(tmp,rgroup>test_prob)
+
+    if(cal_prob > 0) {
+        useForCal <- rbinom(n=dim(dTrain)[[1]],size=1,prob=cal_prob)>0
+        dCal      <- subset(dTrain, useForCal)
+        dTrain    <- subset(dTrain,!useForCal)
+        return(list(dTrain[-which(colnames(dTrain) == "rgroup")],
+                dCal[-which(colnames(dCal) == "rgroup")],
+                dTest[-which(colnames(dTest) == "rgroup")]))
+    }
+
+    return(list(dTrain[-which(colnames(dTrain) == "rgroup")],
+                dTest[-which(colnames(dTest) == "rgroup")]))
+}
+```
+
+### split data into train(70%), calibration(10%), and test(20%)
+```{R message=FALSE, warning=FALSE}
+splits <- data_spilt(accidents, 0.8, 0.1)
+dTrain <- splits[[1]]
+dCal   <- splits[[2]]
+dTest  <- splits[[3]]
+```
+
+Check train data contain all levels, prevent error when we predicting
+```{R message=FALSE, warning=FALSE} 
+for(v in catVars) {
+    if( length(unique(accidents[,v])) != length(unique(dTrain[,v])) ) {
+        for (s in setdiff(unique(accidents[,v]), unique(dTrain[,v]))) {
+            diff <- data_spilt(accidents[which(accidents[,v] == s),], 0.6)[[1]]
+            diff <- diff[-which(colnames(diff) %in% indicator[1:3])]
+            if(length(diff) == 0) {
+                diff <- accidents[which(accidents[,v] == s),]
+            }
+            dTrain <- rbind(dTrain, diff)
+        }
+    }
+}
+lapply(splits,nrow)
+rm(splits, diff, v, s)
+```
+
+### Dataframe for model selection
+```{R message=FALSE, warning=FALSE}
+modelsPerf <- data.frame(modelName=c(), TrainAUC=c(), CalAUC=c(), logLikelyhood=c())
+modelsAUC  <- data.frame(fpr=c(), tpr=c(), model=c())
+```
+
+## Single Variable Classification
+### Categorical
+
+Function to make prediction on single categorical variable prediction
+```{R message=FALSE, warning=FALSE}
+mkPredC <- function(outCol,varCol,appCol, pos=predLabel) {
+    pPos    <- sum(outCol==pos)/length(outCol)
+    naTab   <- table(as.factor(outCol[is.na(varCol)]))
+    pPosWna <- (naTab/sum(naTab))[pos]
+    vTab    <- table(as.factor(outCol),varCol)
+    pPosWv  <- (vTab[pos,]+1.0e-10*pPos)/(colSums(vTab)+1.0e-10)
+    pred    <- pPosWv[appCol]
+    pred[is.na(appCol)] <- pPosWna
+    pred[is.na(pred)]   <- pPos
+    pred
+}
+```
+
+lost prediciton by Single variable variable
+```{R message=FALSE, warning=FALSE}
+for(v in catVars) {
+    pred <- paste(outcome, 'pred', v, sep='_')
+    dTrain[,pred] <- mkPredC(dTrain[,outcome], dTrain[,v], dTrain[,v])
+    dCal  [,pred] <- mkPredC(dTrain[,outcome], dTrain[,v], dCal[,v])
+    dTest [,pred] <- mkPredC(dTrain[,outcome], dTrain[,v], dTest[,v])
+}
+```
+
+Functions for AUC calculation, loglikehood and AUC curve.
+```{R message=FALSE, warning=FALSE}
+calcAUC <- function(predcol, outcol, pos=predLabel) {
+    perf <- performance(prediction(predcol, outcol==pos),'auc')
+    as.numeric(perf@y.values)
+}
+
+calcAUCurve <- function(predcol, outcol, name, pos=predLabel) {
+    perf <- performance(prediction(predcol, outcol==pos), "tpr", "fpr")
+    data.frame(fpr=unlist(perf@x.values),
+               tpr=unlist(perf@y.values),
+               model=name)
+}
+
+logLikelyhood <- function(outCol,predCol, pos=predLabel) {
+    sum(ifelse(outCol==pos, ifelse(predCol==0, log(1.0e-3), log(predCol)), ifelse((1-predCol)==0, log(1.0e-3), log(1-predCol)) ))
+}
+
+```
+
+#### check the base(Null model) negative log Likely hood
+```{R}
+baseRateCheck <- logLikelyhood(
+    dCal[,outcome],
+    sum(dCal[,outcome]==predLabel)/length(dCal[,outcome])
+)
+baseRateCheck
+```
+
+
+### caculate AUC for categorical variables. The higher the AUC, the better the performance of the model at distinguishing between the positive and negative classes. 
+```{R message=FALSE, warning=FALSE}
+for(v in catVars) {
+    pred <- paste(outcome, 'pred', v, sep='_')
+    aucTrain <- calcAUC(dTrain[, pred],dTrain[, outcome])
+
+     if(aucTrain>=0.6) {
+        pred       <- paste(outcome, 'pred', v, sep='_')
+        aucCal <- calcAUC(dCal[, pred], dCal[,outcome])
+        print(sprintf("%s, trainAUC: %4.3f calibrationAUC: %4.3f", v , aucTrain, aucCal))
+    }
+    if(aucTrain >=0.75) {
+        liCheck <- 2*((logLikelyhood(dCal[, outcome], dCal[, pred]) - baseRateCheck))
+        modelsPerf <- rbind(modelsPerf, data.frame(modelName=c(v), TrainAUC=c(aucTrain), CalAUC=c(aucCal), logLikelyhood=c(liCheck)) )
+        modelsAUC  <- rbind(modelsAUC, calcAUCurve(dTrain[, pred],dTrain[, outcome], v))
+    }
+}
+```
+
+We can see NATURE_INJURY and INJ_BODY_PART have both train and calbertion AUC above 0.8, which is impressive, this is just by body parts and nature injury, can make very accurate predictions
+
+### Numberical
+```{R message=FALSE, warning=FALSE}
+mkPredN <- function(outCol, varCol, appCol) {
+  cuts <- unique(as.numeric(quantile(varCol, probs=seq(0, 1, 0.01), na.rm=T)))
+  varC <- cut(varCol, cuts)
+  appC <- cut(appCol, cuts)
+  mkPredC(outCol, varC, appC)
+}
+```
+
+```{R message=FALSE, warning=FALSE}
+for(v in numVars) {
+    pred <- paste(outcome, 'pred', v, sep='_')
+    dTrain[,pred] <- mkPredN(dTrain[,outcome], dTrain[,v], dTrain[,v])
+    dTest[,pred]  <- mkPredN(dTrain[,outcome], dTrain[,v], dTest[,v])
+    dCal[,pred]   <- mkPredN(dTrain[,outcome], dTrain[,v], dCal[,v])
+    aucTrain      <- calcAUC(dTrain[,pred],dTrain[,outcome])
+
+    if(aucTrain >=0.5) {
+        aucCal<-calcAUC(dCal[,pred],dCal[,outcome])
+        print(sprintf("%s, trainAUC: %4.3f calibrationAUC: %4.3f", v ,aucTrain,aucCal))
+    }
+
+    if(aucTrain >=0.51) {
+        liCheck <- 2*((logLikelyhood(dCal[, outcome], dCal[, pred]) - baseRateCheck))
+        modelsPerf <- rbind(modelsPerf, data.frame(modelName=c(v), TrainAUC=c(aucTrain), CalAUC=c(aucCal), logLikelyhood=c(liCheck)) )
+        modelsAUC  <- rbind(modelsAUC, calcAUCurve(dTrain[, pred],dTrain[, outcome], v))
+    }
+}
+rm(v, pred, aucCal, aucTrain)
+```
+
+Numerical variable is not as impressive as categorical variables, as highest AUC is NO INJURIES(above 0.6)
+
+#### Characterising Prediction Quality
+```{R}
+ggplot(data=dCal) +
+    geom_density(aes(x=TOT_EXPER,color=lost))
+```
+The no clear separation on double density plot 
+
+### Variable selection
+
+#### Scoring features according to an AIC - the smaller the better
+
+1. calculate AIC for each variable
+2. Use AIC mines null mode AIC and time 2
+2. if the AIC improvement larger than than an value(our is 50), the store valiables
+
+```{R}
+selVars <- c()
+minStep <- 50
+
+for(v in catVars) {
+    pred <- paste(outcome, 'pred', v, sep='_')
+    liCheck <- 2*((logLikelyhood(dCal[, outcome], dCal[, pred]) - baseRateCheck))
+    if(liCheck >= minStep) {
+        print(sprintf("%s, calibrationScore: %g", v,liCheck))
+        selVars     <- c(selVars, v)
+    }
+}
+
+cat("\n Numerical variable \n\n")
+
+for(v in numVars) {
+    pred <- paste(outcome, 'pred', v, sep='_')
+    liCheck <- 2*((logLikelyhood(dCal[,outcome], dCal[, pred]) - baseRateCheck) - 1)
+    if(liCheck >= minStep) {
+        print(sprintf("%s, calibrationScore: %g", v, liCheck))
+        selVars     <- c(selVars, v)
+    }
+}
+cat('\n ALl variables')
+selVars
+```
+
+## Multivariate models
+Functions for multivariate model performance evaluation.
+```{R message=FALSE, warning=FALSE}
+tradeOffsPlot <- function(df, modelName="model") {
+    p1 <- ggplot(df, aes(x=threshold)) +
+        geom_line(aes(y=precision)) +
+        coord_cartesian(xlim = c(0, 1), ylim=c(0, 1) ) +
+        ggtitle(paste(modelName, "trade-offs precision", sep=" "))
+
+    p2 <- ggplot(df, aes(x=threshold)) +
+        geom_line(aes(y=recall)) +
+        coord_cartesian(xlim = c(0, 1) ) +
+        ggtitle(paste(modelName, "trade-offs recall", sep=" "))
+    grid.arrange(p1, p2, nrow = 2)
+}
+
+predictionQualityPlot <- function(df, by=predLabel, modelName="model") {
+   ggplot(df, aes(x=preds, group=groups, color=groups, linetype=groups)) +
+        geom_density() + 
+        ggtitle(paste(modelName, "Prediction Quality", sep=" "))
+}
+
+aucPlot <- function(df, modelName="model") {
+    ggplot(df, aes(x=fpr, y=tpr, group=model, color=model, linetype=model))+
+        geom_line() +
+        geom_abline(slope = 1, linetype = "dashed") +
+        labs(y = "True Positive Rate", x = "False Positive Rate") +
+        ggtitle(paste(modelName, "auc", sep=" "))
+}
+
+trainAUCdf <- function(models, Data, trueValue, pos, posF, Type, modelName) {
+    if(pos!=predLabel){
+        predValue  <- predict(models, newdata=Data, type=Type)
+    }else{
+        predValue  <- predict(models, newdata=Data, type=Type)[, pos]
+    }
+    predObj    <- prediction(predValue, trueValue)
+    perf       <- performance(predObj, "tpr", "fpr")
+    return(list('df'=data.frame(fpr=unlist(perf@x.values), tpr=unlist(perf@y.values), model=modelName), AUC=performance(predObj, 'auc')@y.values ))
+}
+performancePlot <- function(models, Data, trueValue, trainData, trainTrueValue,
+                    thresholdValue=0.5,
+                    modelName="model",
+                    Type='probability',
+                    pos=predLabel,
+                    posF=predLabelFalse,
+                    plot = TRUE) {
+    if(pos!=predLabel){
+        predValue  <- predict(models, newdata=Data, type=Type)
+    }else{
+        predValue  <- predict(models, newdata=Data, type=Type)[, pos]
+    }
+    predObj    <- prediction(predValue, trueValue)
+    precObj    <- performance(predObj, measure="prec")
+    recObj     <- performance(predObj, measure="rec")
+
+    precision  <- (precObj@y.values)[[1]]
+    prec.x     <- (precObj@x.values)[[1]]
+    recall     <- (recObj@y.values)[[1]]
+    pnull      <- mean(trueValue==pos)
+
+    perf       <- performance(predObj, "tpr", "fpr")
+    df         <- data.frame('fpr'=unlist(perf@x.values), 'tpr'=unlist(perf@y.values), model=paste('Cal ', modelName, sep=""))
+    rocDf      <- data.frame(threshold=prec.x, precision=precision, recall=recall)
+    traindf <- trainAUCdf(models, trainData, trainTrueValue, pos, posF, Type, paste('Train', modelName, sep=' '))
+    p <- aucPlot(rbind(df, traindf[[1]]), modelName)
+    print(p)
+
+    p <- predictionQualityPlot(data.frame('preds' = predValue, 'groups'=as.factor(trueValue)))
+    print(p)
+
+    p <- tradeOffsPlot(rocDf, modelName)
+    print(p)
+
+    cat('Confusion Matrix')
+    ctab.test <- table(pred=ifelse(predValue>thresholdValue, pos, posF), true.values=trueValue)
+    print(kable(ctab.test))
+
+    cat('Classification Quality')
+    pes <- ctab.test[2, 2] / sum(ctab.test[, 2])
+    rcl <- ctab.test[2, 2] / sum(ctab.test[2, ])
+    print(kable(data.frame(performance=c('precision', 'recall', 'F1', 'accuracy '),
+                            percentage=c(pes,
+                                        rcl,
+                                        2*pes*rcl/(pes + rcl),
+                                        (ctab.test[1,1]+ctab.test[2,2])/sum(ctab.test)))))
+    
+    
+    print( paste('Model Log Likelihood:',logLikelyhood(trueValue, predValue)) )
+    cat('\n')
+    print( paste('Null Model Log Likelihood:', logLikelyhood(trueValue, pnull)) )
+
+    return(list( 'DataFrame'=df, 'TrianAUC'=as.numeric(traindf[[2]]), "AUC"=as.numeric(performance(predObj, 'auc')@y.values), 'logLH'=logLikelyhood(trueValue, predValue) ))
+}
+```
+
+### First Multivariate model - Naïve Bayes
+
+```{R message=FALSE, warning=FALSE}
+lVars <- dependent
+ff <- paste(outcome, ' ~ ', paste(lVars,collapse=' + '), sep='')
+model.nb <- naiveBayes(as.formula(ff), data=dTrain)
+```
+
+```{R message=FALSE, warning=FALSE}
+output <- performancePlot(model.nb, dCal, dCal[,outcome], dTrain, dTrain[, outcome], Type='raw', modelName="Naive Bayes", thresholdValue=0.5)
+df <- data.frame(modelName=c('Naive Bayes'), TrainAUC=c(output[[2]]), CalAUC=c(output[[3]]), logLikelyhood=c(output[[4]]))
+modelsPerf <- rbind(modelsPerf, df)
+modelsAUC <- rbind(modelsAUC, output[[1]])
+```
+We can see this model has a calibration negative log likelihood: -13180.34 < negative Null Model Log Likelihood: -10641.022. Indicate this mode performance is not good.
+
+With on precision 0.89, recall 0.75 and F1 score 0.81 and accuracy 0.78 - all looks reasonable. But in this context we look for higher accuracy, as true negative prediction is a lost to company, and false negative, employees will not accept it.
+
+And we see there's no overfilling by viewing the Train and Calibration AUC. So not need to do cross validation.
+
+By check the double density plot graph, it give us evidence why the log likelihood is worse than the Null Model - the two density line is not perfectly separated(0.25 - 0.9).
+
+Looking at the thresholds graph, there's no good position on pick threshold value -  half and half is a good option
+
+### Naïve Bayes with selected variable
+```{R message=FALSE, warning=FALSE}
+lVars <- selVars
+ff    <- paste(outcome, ' ~ ', paste(lVars,collapse=' + '), sep='')
+model.nb.sel <- naiveBayes(as.formula(ff), data=dTrain)
+```
+
+```{R message=FALSE, warning=FALSE}
+output       <- performancePlot(model.nb.sel, dCal, dCal[,outcome], dTrain, dTrain[, outcome], Type='raw', modelName="Naive Bayes selvar", thresholdValue=0.5) 
+df         <- data.frame(modelName=c('Naive Bayes selected'), TrainAUC=c(output[[2]]), CalAUC=c(output[[3]]), logLikelyhood=c(output[[4]]))
+modelsPerf <- rbind(modelsPerf, df)
+modelsAUC  <- rbind(modelsAUC, output[[1]])
+```
+
+Same as full variable Naïve Bayes model, With better Log Likelihood: -13158, but perform better.
+
+### Second Multivariate model - Decision Tree with all variables
+```{R message=FALSE, warning=FALSE}
+model.j48   <- J48(dTrain$lost~., dTrain[, dependent])
+```
+
+```{R message=FALSE, warning=FALSE}
+output      <- performancePlot(model.j48, dCal, dCal[,outcome], dTrain, dTrain[, outcome], modelName="Decision Tree", thresholdValue=0.54)
+df          <- data.frame(modelName=c('Decision Tree'), TrainAUC=c(output[[2]]), CalAUC=c(output[[3]]), logLikelyhood=c(output[[4]]))
+modelsPerf  <- rbind(modelsPerf, df)
+modelsAUC   <- rbind(modelsAUC, output[[1]]) 
+```
+We can see this model perform much better than the Naïve Bayes model with negative log likelihood: -7641.78 and Null Model Log Likelihood: -10641.02, with tain AUC 0.868 and Calibration 0.854. With improvement on precision (), recall() F1 score () and accuracy(0.81) - better than neive model. And we see there's no overfitting by viewing the Train and Calibration AUC. We see the double density plot graph, we can see there's separation between group '[0]' and '[1]', but there's overlap between 0.25 which not pleasant.
+
+Looking at the thresholds graph, thresholds below 0.3 precsion is too low, and above 0.6 recall drop exponentially. Threshold between 0.47 - 0.55 is reasonable.
+
+### Decision Tree with selected variable
+```{R message=FALSE, warning=FALSE}
+model.j48.sel <- J48(dTrain$lost~., dTrain[, selVars])
+```
+
+```{R message=FALSE, warning=FALSE}
+output        <- performancePlot(model.j48.sel, dCal, dCal[,outcome], dTrain, dTrain[, outcome], modelName="Decision Tree selvar", thresholdValue=0.54)
+df            <- data.frame(modelName=c('Decision Tree selected'), TrainAUC=c(output[[2]]), CalAUC=c(output[[3]]), logLikelyhood=c(output[[4]]))
+modelsPerf    <- rbind(modelsPerf, df)
+modelsAUC     <- rbind(modelsAUC, output[[1]]) 
+```
+Same as above decision tree all variable model, with better performance by improve negative Log Likelihood: -7641.78 to -7493.3, and slitely improvement on precision, recall and F1 score.
+
+### Third Multivariate model - Logistic regression
+```{R message=FALSE, warning=FALSE}
+model.gl.full <- glm(formula=paste(outcome, paste(dependent, collapse=" + "), sep=" ~ "), data=dTrain, family=binomial(link="logit"))
+```
+
+```{R message=FALSE, warning=FALSE}
+output        <- performancePlot(model.gl.full, dCal, dCal[,outcome], dTrain, dTrain[, outcome], Type='response', pos="no", modelName="Logistic", thresholdValue=0.55)
+df            <- data.frame(modelName=c('Logistic'), TrainAUC=c(output[[2]]), CalAUC=c(output[[3]]), logLikelyhood=c(output[[4]]))
+modelsPerf    <- rbind(modelsPerf, df)
+modelsAUC     <- rbind(modelsAUC, output[[1]]) 
+```
+This mode is the best performed mode currently. With negative log likelihood: -6621.01 and Null Model Log Likelihood: -97848.35, and tain AUC 0.879 and Calibration AUC 0.875. With improvement on precision (), recall() and F1 score (). Compare to decision tree F1 score is lower, but not significant And we see there's no overfitting by viewing the Train and Calibration AUC. We see the double density plot graph, we can see. there's a good separation between group '[0]' and '[1]'.
+
+Looking at the thresholds graph, pretty hard to pick, somewhere between 0.46 and 0.56 should be fine
+
+### Logistic regression with selected variables
+```{R message=FALSE, warning=FALSE}
+model.gl.sel<- glm(formula=paste(outcome, paste(selVars, collapse=" + "), sep=" ~ "), data=dTrain, family=binomial(link="logit"))
+```
+
+```{R message=FALSE, warning=FALSE}
+output      <-performancePlot(model.gl.sel, dCal, dCal[,outcome], dTrain, dTrain[, outcome], Type='response', pos="no", modelName="Logistic selvar", thresholdValue=0.55)
+df          <- data.frame(modelName=c('Logistic selected'), TrainAUC=c(output[[2]]), CalAUC=c(output[[3]]), logLikelyhood=c(output[[4]]))
+modelsPerf  <- rbind(modelsPerf, df)
+modelsAUC   <- rbind(modelsAUC, output[[1]]) 
+```
+Same as above but didn't perform as well as the full model, With negative log likelihood: -6628.86 and Null Model Log Likelihood: -97848.35. 
+
+And logistic is the best performing model, 
+
+## Check model rank AUC rank and AUC plot
+```{R message=FALSE, warning=FALSE}
+kable(modelsPerf[order(-modelsPerf$CalAUC), ])
+```
+We can see the the logistic model has highest train AUC, with slightly higher AUC than other multi variable models. But the double density plot is the best compare to other models. So we prefer logistic model.
+
+Check ROC Curves
+```{R message=FALSE, warning=FALSE}
+aucPlot(modelsAUC[-which(modelsAUC$model %in% c('day', 'CAL_YR', 'ACCIDENT_TIME', 'hours', 'MINE_EXPER', 'JOB_EXPER',
+                                                'TOT_EXPER', 'NO_INJURIES', 'INJURY_SOURCE', 'ACCIDENT_TYPE')),])
+```
+
+# Evaluate selected logistic model on the Test set
+```{R message=FALSE, warning=FALSE}
+output <- performancePlot(model.gl.full, dTest, dTest[,outcome], dTrain, dTrain[, outcome], Type='response', pos="no", thresholdValue=0.55)
+
+cat('\n Testing AUC\n')
+output[[3]]
+```
+
+By using the logistic full model on testing data, we can see the model perform much better than null mode, AUC improve form -242013 to -16202, With AUC (). All mode performance measure look pretty reasonably, above 80%.
+
+# Conclusion
+Predicting the outcome of the injury (sum (Days away from work, Days restricted, Days charged)), all multiple variable models have reasonable performance, Logistic model performed the best. In this data set we remove narratives, this response variable may contain very important information to predict the outcome. Also we can use other model to predict the numerical lost rather than no lost and lost - such as linear regression, random forest and deep neural network.
+ 
+# Part 2 - Clustering
+functions to do K-clusters selection
+```{R message=FALSE, warning=FALSE}
+# Function to calculate squared distance
+# between two vectors x and y
+sqr_edist <- function(x, y) {
+    sum((x-y)^2)
+}
+
+# Function to calculate WSS of a cluster
+wss.cluster <- function(clustermat) {
+    c0 <- apply(clustermat, 2, FUN=mean)
+    sum(apply(clustermat, 1,
+    FUN=function(row){sqr_edist(row,c0)}))
+}
+
+# Calculating the Total WSS
+wss.total <- function(dmatrix, labels) {
+    wsstot <- 0
+    k <- length(unique(labels))
+    for(i in 1:k){
+        wsstot <- wsstot +
+        wss.cluster(subset(dmatrix, labels==i))
+    }
+    wsstot
+}
+
+# Function to calculate total sum of squares
+totss <- function(dmatrix) {
+    grandmean <- apply(dmatrix, 2, FUN=mean)
+            sum(apply(dmatrix, 1,
+            FUN=function(row){sqr_edist(row, grandmean)}
+        )
+    )
+}
+
+# Function to calculate CH Index
+ch_criterion <- function(d, kmax, method="kmeans") {
+    if(!(method %in% c("kmeans", "hclust"))){
+        stop("method must be one of c('kmeans', 'hclust')")
+    }
+    npts <- dim(d)[1] # number of rows.
+    totss <- totss(d)
+    wss <- numeric(kmax)
+    crit <- numeric(kmax)
+    wss[1] <- (npts-1)*sum(apply(d, 2, var))
+    for(k in 2:kmax) {
+        # d <- dist(dmatrix, method="euclidean")
+        pfit <- hclust(as.dist(d), method="ward.D2")
+        labels <- cutree(pfit, k=k)
+        wss[k] <- wss.total(d, labels)
+    }
+    bss <- totss - wss
+    crit.num <- bss/(0:(kmax-1))
+    crit.num[1] <- 5
+    crit.denom <- wss/(npts - 1:kmax)
+    list(crit = crit.num/crit.denom, wss = wss, totss = totss)
+}
+```
+
+#### Clean up some data, and divides some numerical data to ordinal data and only consider accdients causing (SCHEDULE_CHARGE + DAYS_LOST + DAYS_RESTRICT) > 0
+```{R message=FALSE, warning=FALSE}
+'%!in%' <- function(x,y)!('%in%'(x,y))
+accidents <- read.csv("accidents.cleaned.csv") %>%
+             mutate(risk = SCHEDULE_CHARGE + DAYS_LOST + DAYS_RESTRICT)
+accidents <- accidents[which(accidents$NO_INJURIES>0 & accidents$risk>0 & accidents$DEGREE_INJURY %!in% c('ALL OTHER CASES (INCL 1ST AID)', 'INJURIES DUE TO NATURAL CAUSES', 'INJURIES INVOLVNG NONEMPLOYEES', 'OCCUPATNAL ILLNESS NOT DEG 1-6') & accidents$INJ_BODY_PART != 'UNCLASSIFIED'), 2:length(accidents)] %>%
+             mutate(risk =  cut(risk, breaks=c(0, 50, 200, 500, Inf), labels = c('low risk', 'Midium risk', 'High risk', 'very High risk')))
+
+for( n in colnames(accidents)){
+  accidents <- accidents[which(accidents[, n]!="NO VALUE FOUND" & accidents[, n]!='UNKNOWN' & accidents[, n]!=""),]
+}
+
+for( n in c('TOT_EXPER.isbad', 'MINE_EXPER.isbad', 'JOB_EXPER.isbad')){
+  accidents <- accidents[which(accidents[, n]!=1),]
+}
+```
+
+only use OCCUPATION, ACTIVITY, INJURY_SOURCE, CLASSIFICATION, ACCIDENT_TYPE ,TOT_EXPER and custom variable risk to clustering Injury BODY_PART
+```{R message=FALSE, warning=FALSE}
+accidents <- accidents[,c('INJ_BODY_PART', 'OCCUPATION', 'ACTIVITY', 'INJURY_SOURCE', 'CLASSIFICATION', 'ACCIDENT_TYPE', 'TOT_EXPER', 'risk')] %>%
+             mutate(TOT_EXPER=cut(TOT_EXPER, breaks=c(0, 3, 7, 12, 20, Inf),   labels = c('Entry Level', 'Mid level', 'senior level', 'Director level', 'Chief level')))
+```
+
+Using Cosine similarity to measure cohesion within INJ_BODY_PART:
+
+1. a weight vector(w1, w2), s.t w1 + w2 = 1
+
+2. Combine similarity between different attributes, by d(x,y) = w1*d(x, z) + w2*d(x, a)
+
+```{R message=FALSE, warning=FALSE}
+library(reshape2)
+pivoted <- function(col){
+    ff <- as.formula(paste('INJ_BODY_PART', col, sep=' ~ '))
+    df <- dcast(data = accidents, formula = ff, fun.aggregate = length, value.var=col)
+    row.names(df) <- df$INJ_BODY_PART
+    df <- df[, 2:length(df)]
+}
+
+```
+
+```{R message=FALSE, warning=FALSE}
+tmp <- NULL
+cos.sim <- function(DF){
+    Matrix <- as.matrix(DF)
+    as.dist(1 - Matrix%*%t(Matrix)/(sqrt(rowSums(Matrix^2) %*% t(rowSums(Matrix^2))))) 
+}
+euclidean.sim <- function(DF) {
+    Matrix <- as.matrix(DF)
+    dist(Matrix, method = "euclidean")
+}
+manhattan.sim <- function(DF) {
+    Matrix <- as.matrix(DF)
+    dist(Matrix, method = "manhattan")
+}
+
+dfPivoted <- lapply(c('OCCUPATION', 'ACTIVITY', 'INJURY_SOURCE', 'CLASSIFICATION', 'ACCIDENT_TYPE', 'TOT_EXPER', 'risk'), pivoted)
+names(dfPivoted) <- c('OCCUPATION', 'ACTIVITY', 'INJURY_SOURCE', 'CLASSIFICATION', 'ACCIDENT_TYPE', 'TOT_EXPER', 'risk')
+
+# probability using 
+weight <- c( 0.05, 0.2, 0.15, 0.2, 0.2, 0.5, 0.15)
+mesaure <- function(){
+    d <- distances[[1]]* weight[1]
+    for(i in 2:length(dfPivoted)){
+        d <- d +  distances[[i]]* weight[i]
+    }
+    hfit <- hclust(as.dist(d), method = 'ward.D2')
+    dendr <- dendro_data(hfit, type="rectangle")
+    p<-ggplot() + 
+    geom_segment(data=segment(dendr), aes(x=x, y=y, xend=xend, yend=yend)) + 
+    geom_text(data=label(dendr), aes(x=x, y=y, label=label, hjust=0), size=3) +
+    coord_flip() + scale_y_reverse(expand=c(0.2, 0)) +
+    theme(axis.line.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.text.y=element_blank(),
+            axis.title.y=element_blank(),
+            text = element_text(size=8),
+            panel.background=element_rect(fill="white"),
+            panel.grid=element_blank())
+    print(p)
+    hfit
+}
+library(ggdendro)
+```
+
+Tried all the distance measure Euclidean , Manhattan and Cosine Similarity. The clusters produces by Cosine Similarity is most reasonable. This make sense as Cosine Similarity determine how similar the documents are irrespective of their size. In this context, we trying clustering which body parts relate to each other, and count how many time each words occurred. So even count is different, they could still have a smaller angle between them.  
+
+# plot the hierarchical cluster
+```{R, fig.width=10, fig.height=15}
+distances <- lapply(dfPivoted, cos.sim)
+hfit.cos <- mesaure()
+```
+
+By viewing the graph we see Injure body parts to were classified to similar groups, for example the head part- (ear, face, jaw, nose mouth) in silimer group
+
+
+```{R, fig.width=10, fig.height=15}
+# distances <- lapply(dfPivoted, euclidean.sim)
+# hfit.euclidean <- mesaure()
+```
+
+```{R, fig.width=10, fig.height=15}
+# distances <- lapply(dfPivoted, manhattan.sim)
+# hfit.euclidean <- mesaure()
+```
+
+
+### Extract members of each cluster using cutree()
+```{R message=FALSE, warning=FALSE}
+numCluster <-8
+groups <- cutree(hfit.cos, k=numCluster)
+print_clusters <- function(labels, k) {
+    for(i in 1:k) {
+        print(paste("cluster", i))
+        cat('====================\n')
+        cat(paste(names(groups[groups == i]), collapse = "\t"))
+        cat('\n\n')
+    }
+}
+print_clusters(groups, numCluster)
+```
+
+numCluster 8:  based on analysis below
+
+###  interpretation
+cluster 3 : contain injury body parts around non-lethal position
+cluster 5 : contain injury body parts may cause fatal and serious injury
+cluster 6": contain very board information around the head
+
+
+## Visualising Cluster
+
+Cuted tree
+```{R message=FALSE, warning=FALSE, fig.height=15, fig.width=10}
+library(factoextra)
+hfit.cos %>% fviz_dend(cex = 0.5, k = 8, palette = "jco", horiz = TRUE)
+```
+
+
+```{R message=FALSE, warning=FALSE}
+d <- distances[[1]]* weight[1]
+for(i in 2:length(dfPivoted)){
+    d <- d +  distances[[i]]* weight[i]
+}
+d <- as.matrix(d)
+princ <- prcomp(d)
+nComp <- 2
+project <- as.data.frame(predict(princ, newdata=d)[,1:nComp])
+project.plus <- cbind(project, cluster=as.factor(groups), bodyParts=names(groups))
+```
+
+```{R message=FALSE, warning=FALSE}
+# finding convex hull
+library('grDevices')
+h <- do.call(
+  rbind,
+  lapply(
+    unique(groups),
+    function(c) {
+    f <- subset(project.plus, cluster==c);
+    f[chull(f),]
+  })
+)
+```
+
+```{R message=FALSE, warning=FALSE, fig.height=10, fig.width=10}
+ggplot(project.plus, aes(x=PC1, y=PC2)) +
+  geom_point(aes(shape=cluster, color=cluster)) +
+  geom_text(aes(label=bodyParts, color=cluster),
+  hjust=0, vjust=1, size=3) +
+  geom_polygon(data=h,
+  aes(group=cluster,
+  fill=as.factor(cluster)),
+  alpha=0.4,linetype=0)
+```
+
+```{R message=FALSE, warning=FALSE}
+library(fpc)
+kbest.p <- numCluster
+cboot.hclust <- clusterboot(
+  d, clustermethod=hclustCBI,
+  method="ward.D2", k=kbest.p)
+```
+```{R}
+summary(cboot.hclust$result)
+```
+
+```{R message=FALSE, warning=FALSE}
+groups <- cboot.hclust$result$partition
+print_clusters(groups, numCluster)
+```
+
+```{R message=FALSE, warning=FALSE}
+cat('\nStability:\n')
+1-cboot.hclust$bootbrd/100
+```
+All looks like stable except cluster 4
+
+## Selecting K  based on  Calinski-Harabasz index
+```{R message=FALSE, warning=FALSE}
+k=10
+clustcrit <- ch_criterion(d, k, method="hclust")
+
+critframe <- data.frame(k=1:k, ch=scale(clustcrit$crit), wss=scale(clustcrit$wss))
+
+critframe <- melt(critframe, id.vars=c("k"),
+                  variable.name="measure",
+                  value.name="score")
+
+p<-ggplot(critframe, aes(x=k, y=score, color=measure)) +
+          geom_point(aes(shape=measure)) +
+          geom_line(aes(linetype=measure)) +
+          scale_x_continuous(breaks=1:k, labels=1:k)
+p
+```
+The smaller wss the better the cluster and 
+the higher the ch the better the cluster
+
+So we see, Ch index improved on k is 7 and 8
+
+cluster is 3 is too small, so do not consider cluster
+
+so pick 7 or 8 is reasonable
+
+# Conclusions
+Use cluster to group injury body parts Is feasible, similar Body parts were  grouped into same group. And by further analysis the cluster result, workers can do more protection on a certain point based on the clustering result. But for multidimensional similarity clustering, a better way to pick weight vector may product better cluster result.
